@@ -1476,6 +1476,11 @@ def parse_user_intent(utterance: str) -> tuple:
         return ('ingredient', {'ingredient': clean_text, 'linked_filter': linked_filter, 'month': month})
 
     # ─── 7. 위 모든 것에 해당 안 되면 ───
+    # 질문 의도 → Gemini가 답변 ("DMF가 뭐야?", "연계심사란?" 등)
+    question_words = ['뭐야', '뭐에요', '뭔가요', '무엇', '뭘까', '뭐지', '무슨 뜻', '란?', '이란', '알고 싶', '설명해']
+    if any(kw in text for kw in question_words):
+        return ('help', {})
+
     # 날짜 관련 단어만 있었으면 → 주간 현황으로
     if any(kw in text for kw in ['등록', '현황', 'dmf', '신규']):
         return ('weekly', {})
