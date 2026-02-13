@@ -41,8 +41,18 @@ logger = logging.getLogger("dmf-server")
 
 
 # ═══════════════════════════════════════════
-# 공통 데이터 함수 (MCP + 카카오 공유)
+# 데이터 캐싱 (카카오 5초 타임아웃 대응)
 # ═══════════════════════════════════════════
+
+import threading
+
+_cache = {
+    "df": None,           # 캐싱된 DataFrame
+    "last_updated": None, # 마지막 업데이트 시각
+    "loading": False      # 로딩 중 여부
+}
+CACHE_TTL = timedelta(hours=24)  # 하루 1회 갱신
+
 
 def _download_dmf_excel() -> str:
     """의약품안전나라에서 DMF 엑셀 다운로드 → 임시 파일 경로 반환"""
@@ -56,6 +66,41 @@ def _download_dmf_excel() -> str:
     tmp.close()
     logger.info(f"✅ 다운로드 완료: {tmp.name}")
     return tmp.name
+
+
+def _get_cached_data() -> pd.DataFrame:
+    """캐싱된 데이터 반환. 없거나 만료되면 새로 다운로드."""
+    now = datetime.now()
+
+    # 캐시가 유효하면 바로 반환
+    if (_cache["df"] is not None and
+        _cache["last_updated"] is not None and
+        now - _cache["last_updated"] < CACHE_TTL):
+        logger.info("⚡ 캐시 데이터 사용")
+        return _cache["df"]
+
+    # 캐시 갱신
+    logger.info("🔄 캐시 갱신 중...")
+    excel_path = _download_dmf_excel()
+    try:
+        df = _load_and_prepare(excel_path)
+        _cache["df"] = df
+        _cache["last_updated"] = now
+        logger.info(f"✅ 캐시 갱신 완료 ({len(df)}건)")
+        return df
+    finally:
+        os.unlink(excel_path)
+
+
+def _preload_cache():
+    """서버 시작 시 백그라운드로 캐시 미리 로드"""
+    try:
+        _cache["loading"] = True
+        _get_cached_data()
+    except Exception as e:
+        logger.error(f"❌ 캐시 프리로드 실패: {e}")
+    finally:
+        _cache["loading"] = False
 
 
 def _load_and_prepare(excel_path: str) -> pd.DataFrame:
@@ -89,9 +134,8 @@ def _load_and_prepare(excel_path: str) -> pd.DataFrame:
 
 def analyze_weekly_dmf(weeks_ago: int = 1) -> dict:
     """주간 DMF 등록 현황 분석"""
-    excel_path = _download_dmf_excel()
     try:
-        active = _load_and_prepare(excel_path)
+        active = _get_cached_data()
 
         today = datetime.today()
         days_since_monday = today.weekday()
@@ -128,15 +172,15 @@ def analyze_weekly_dmf(weeks_ago: int = 1) -> dict:
             "연계심사_있음": int(week_df['has_연계심사'].sum()),
             "상세내역": details
         }
-    finally:
-        os.unlink(excel_path)
+    except Exception as e:
+        logger.error(f"주간 분석 실패: {e}")
+        raise
 
 
 def analyze_monthly_dmf(months_ago: int = 1) -> dict:
     """월간 DMF 등록 현황 분석"""
-    excel_path = _download_dmf_excel()
     try:
-        active = _load_and_prepare(excel_path)
+        active = _get_cached_data()
 
         today = datetime.today()
         target_end = today.replace(day=1) - timedelta(days=1)
@@ -191,15 +235,15 @@ def analyze_monthly_dmf(months_ago: int = 1) -> dict:
             "국가별_분포": country_list,
             "주요_신청인_TOP5": applicant_list
         }
-    finally:
-        os.unlink(excel_path)
+    except Exception as e:
+        logger.error(f"월간 분석 실패: {e}")
+        raise
 
 
 def search_ingredient(ingredient: str) -> dict:
     """성분명으로 DMF 검색"""
-    excel_path = _download_dmf_excel()
     try:
-        active = _load_and_prepare(excel_path)
+        active = _get_cached_data()
 
         mask = active['성분명'].astype(str).str.contains(ingredient, case=False, na=False)
         found = active[mask].sort_values('최초등록일자', ascending=False)
@@ -226,15 +270,15 @@ def search_ingredient(ingredient: str) -> dict:
             "신청인_수": int(found['신청인'].nunique()),
             "등록내역": entries
         }
-    finally:
-        os.unlink(excel_path)
+    except Exception as e:
+        logger.error(f"성분 검색 실패: {e}")
+        raise
 
 
 def search_country(country: str) -> dict:
     """국가별 DMF 검색"""
-    excel_path = _download_dmf_excel()
     try:
-        active = _load_and_prepare(excel_path)
+        active = _get_cached_data()
 
         mask = active['제조국가'].astype(str).str.contains(country, case=False, na=False)
         found = active[mask].sort_values('최초등록일자', ascending=False)
@@ -264,15 +308,15 @@ def search_country(country: str) -> dict:
             "주요_성분_TOP10": ingredient_list,
             "주요_제조소_TOP10": mfr_list
         }
-    finally:
-        os.unlink(excel_path)
+    except Exception as e:
+        logger.error(f"국가 검색 실패: {e}")
+        raise
 
 
 def generate_chat_summary() -> str:
     """카카오톡 공유용 간결한 요약 메시지"""
-    excel_path = _download_dmf_excel()
     try:
-        active = _load_and_prepare(excel_path)
+        active = _get_cached_data()
 
         today = datetime.today()
         days_since_monday = today.weekday()
@@ -315,8 +359,9 @@ def generate_chat_summary() -> str:
             lines.append("출처: 의약품안전나라 DMF 심사결과")
 
         return "\n".join(lines)
-    finally:
-        os.unlink(excel_path)
+    except Exception as e:
+        logger.error(f"요약 생성 실패: {e}")
+        raise
 
 
 # ═══════════════════════════════════════════
@@ -376,7 +421,15 @@ if MCP_AVAILABLE:
 # [2] 카카오 i 오픈빌더 Skill 웹훅 API
 # ═══════════════════════════════════════════
 
-app = FastAPI(title="DMF Intelligence Server", version="2.0")
+@asynccontextmanager
+async def lifespan(app):
+    """서버 시작 시 캐시 프리로드"""
+    thread = threading.Thread(target=_preload_cache, daemon=True)
+    thread.start()
+    logger.info("🚀 백그라운드 캐시 프리로드 시작")
+    yield
+
+app = FastAPI(title="DMF Intelligence Server", version="2.0", lifespan=lifespan)
 
 
 def kakao_simple_text(text: str) -> dict:
@@ -578,11 +631,29 @@ async def health_check():
     return {
         "status": "running",
         "service": "DMF Intelligence Server",
+        "cache": "loaded" if _cache["df"] is not None else "empty",
+        "last_updated": str(_cache["last_updated"]) if _cache["last_updated"] else None,
         "endpoints": {
             "kakao_webhook": "/kakao/skill",
             "mcp_sse": "/sse" if MCP_AVAILABLE else "not available"
         }
     }
+
+
+@app.get("/refresh")
+async def refresh_cache():
+    """캐시 강제 갱신 (Cron Job용) — 매일 아침 7시 호출"""
+    try:
+        _cache["df"] = None
+        _cache["last_updated"] = None
+        _get_cached_data()
+        return {
+            "status": "refreshed",
+            "records": len(_cache["df"]),
+            "updated_at": str(_cache["last_updated"])
+        }
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
 
 
 @app.post("/kakao/skill")
@@ -599,6 +670,12 @@ async def kakao_skill_handler(request: Request):
         params = body.get("action", {}).get("params", {})
 
         logger.info(f"📨 카카오 요청: '{utterance}' | params: {params}")
+
+        # 캐시가 아직 준비 안 됐으면 즉시 안내
+        if _cache["df"] is None and _cache["loading"]:
+            return JSONResponse(kakao_simple_text(
+                "🔄 서버가 준비 중입니다.\n10초 후 다시 시도해주세요!"
+            ))
 
         intent, extracted = parse_user_intent(utterance)
 
