@@ -1555,8 +1555,10 @@ async def kakao_skill_handler(request: Request):
             text = format_weekly_for_kakao(data)
             return JSONResponse(kakao_quick_replies(text, [
                 {"messageText": "월간", "action": "message", "label": "📊 월간 리포트"},
-                {"messageText": "요약", "action": "message", "label": "📋 채팅 공유용"},
-                {"messageText": "도움", "action": "message", "label": "❓ 사용법"}
+                {"messageText": "요약", "action": "message", "label": "💬 채팅 공유용"},
+                {"messageText": "인도", "action": "message", "label": "🇮🇳 인도 DMF"},
+                {"messageText": "세파클러", "action": "message", "label": "💊 성분 검색"},
+                {"messageText": "최근 3일", "action": "message", "label": "📅 최근 등록"}
             ]))
 
         elif intent == 'monthly':
@@ -1565,12 +1567,19 @@ async def kakao_skill_handler(request: Request):
             return JSONResponse(kakao_quick_replies(text, [
                 {"messageText": "주간", "action": "message", "label": "📋 주간 현황"},
                 {"messageText": "인도", "action": "message", "label": "🇮🇳 인도 DMF"},
-                {"messageText": "도움", "action": "message", "label": "❓ 사용법"}
+                {"messageText": "중국", "action": "message", "label": "🇨🇳 중국 DMF"},
+                {"messageText": "세파클러", "action": "message", "label": "💊 성분 검색"},
+                {"messageText": "요약", "action": "message", "label": "💬 채팅 공유용"}
             ]))
 
         elif intent == 'summary':
             text = generate_chat_summary()
-            return JSONResponse(kakao_simple_text(text))
+            return JSONResponse(kakao_quick_replies(text, [
+                {"messageText": "주간", "action": "message", "label": "📋 주간 현황"},
+                {"messageText": "월간", "action": "message", "label": "📊 월간 리포트"},
+                {"messageText": "인도", "action": "message", "label": "🇮🇳 인도 DMF"},
+                {"messageText": "세파클러", "action": "message", "label": "💊 성분 검색"}
+            ]))
 
         elif intent == 'date_range':
             start = extracted.get('start', datetime.today())
@@ -1580,20 +1589,32 @@ async def kakao_skill_handler(request: Request):
             return JSONResponse(kakao_quick_replies(text, [
                 {"messageText": "주간", "action": "message", "label": "📋 주간 현황"},
                 {"messageText": "월간", "action": "message", "label": "📊 월간 리포트"},
-                {"messageText": "도움", "action": "message", "label": "❓ 메뉴"}
+                {"messageText": "인도", "action": "message", "label": "🇮🇳 인도 DMF"},
+                {"messageText": "세파클러", "action": "message", "label": "💊 성분 검색"}
             ]))
 
         elif intent == 'country':
             country = extracted.get('country', params.get('country', ''))
             if not country:
-                return JSONResponse(kakao_simple_text("어느 국가의 DMF를 검색할까요?\n\n예: 인도, 중국, 일본, 미국"))
+                return JSONResponse(kakao_quick_replies(
+                    "어느 국가의 DMF를 검색할까요?", [
+                    {"messageText": "인도", "action": "message", "label": "🇮🇳 인도"},
+                    {"messageText": "중국", "action": "message", "label": "🇨🇳 중국"},
+                    {"messageText": "일본", "action": "message", "label": "🇯🇵 일본"},
+                    {"messageText": "미국", "action": "message", "label": "🇺🇸 미국"},
+                    {"messageText": "독일", "action": "message", "label": "🇩🇪 독일"},
+                    {"messageText": "이탈리아", "action": "message", "label": "🇮🇹 이탈리아"}
+                ]))
             data = search_country(country)
             text = format_country_for_kakao(data)
-            return JSONResponse(kakao_quick_replies(text, [
-                {"messageText": "주간", "action": "message", "label": "📋 주간 현황"},
-                {"messageText": "월간", "action": "message", "label": "📊 월간 리포트"},
-                {"messageText": "도움", "action": "message", "label": "❓ 메뉴"}
-            ]))
+            # 검색한 국가 외 다른 주요 국가 버튼 제공
+            other_countries = [c for c in ['인도', '중국', '일본', '미국', '독일'] if c != country]
+            replies = [{"messageText": "주간", "action": "message", "label": "📋 주간 현황"}]
+            for c in other_countries[:3]:
+                flag = {'인도': '🇮🇳', '중국': '🇨🇳', '일본': '🇯🇵', '미국': '🇺🇸', '독일': '🇩🇪'}.get(c, '🌍')
+                replies.append({"messageText": c, "action": "message", "label": f"{flag} {c} DMF"})
+            replies.append({"messageText": "세파클러", "action": "message", "label": "💊 성분 검색"})
+            return JSONResponse(kakao_quick_replies(text, replies))
 
         elif intent == 'applicant':
             applicant = extracted.get('applicant', params.get('applicant', ''))
@@ -1604,8 +1625,9 @@ async def kakao_skill_handler(request: Request):
             text = format_applicant_for_kakao(data)
             return JSONResponse(kakao_quick_replies(text, [
                 {"messageText": "주간", "action": "message", "label": "📋 주간 현황"},
-                {"messageText": "월간", "action": "message", "label": "📊 월간 리포트"},
-                {"messageText": "도움", "action": "message", "label": "❓ 메뉴"}
+                {"messageText": "인도", "action": "message", "label": "🇮🇳 인도 DMF"},
+                {"messageText": "세파클러", "action": "message", "label": "💊 성분 검색"},
+                {"messageText": "월간", "action": "message", "label": "📊 월간 리포트"}
             ]))
 
         elif intent == 'ingredient':
@@ -1644,16 +1666,18 @@ async def kakao_skill_handler(request: Request):
                 text = format_applicant_for_kakao(uni_data)
                 return JSONResponse(kakao_quick_replies(text, [
                     {"messageText": "주간", "action": "message", "label": "📋 주간 현황"},
-                    {"messageText": "월간", "action": "message", "label": "📊 월간 리포트"},
-                    {"messageText": "도움", "action": "message", "label": "❓ 메뉴"}
+                    {"messageText": "인도", "action": "message", "label": "🇮🇳 인도 DMF"},
+                    {"messageText": "세파클러", "action": "message", "label": "💊 성분 검색"},
+                    {"messageText": "월간", "action": "message", "label": "📊 월간 리포트"}
                 ]))
 
             elif search_type == 'manufacturer':
                 text = format_manufacturer_for_kakao(uni_data)
                 return JSONResponse(kakao_quick_replies(text, [
                     {"messageText": "주간", "action": "message", "label": "📋 주간 현황"},
-                    {"messageText": "월간", "action": "message", "label": "📊 월간 리포트"},
-                    {"messageText": "도움", "action": "message", "label": "❓ 메뉴"}
+                    {"messageText": "인도", "action": "message", "label": "🇮🇳 인도 DMF"},
+                    {"messageText": "세파클러", "action": "message", "label": "💊 성분 검색"},
+                    {"messageText": "월간", "action": "message", "label": "📊 월간 리포트"}
                 ]))
 
             else:
@@ -1668,33 +1692,29 @@ async def kakao_skill_handler(request: Request):
             return JSONResponse(kakao_quick_replies(gemini_response, [
                 {"messageText": "주간", "action": "message", "label": "📋 주간 현황"},
                 {"messageText": "월간", "action": "message", "label": "📊 월간 리포트"},
-                {"messageText": "최근 3일", "action": "message", "label": "📅 최근 3일"},
-                {"messageText": "도움", "action": "message", "label": "❓ 메뉴"}
+                {"messageText": "인도", "action": "message", "label": "🇮🇳 인도 DMF"},
+                {"messageText": "세파클러", "action": "message", "label": "💊 성분 검색"},
+                {"messageText": "최근 3일", "action": "message", "label": "📅 최근 등록"},
+                {"messageText": "요약", "action": "message", "label": "💬 채팅 공유용"}
             ]))
 
         # ─── Fallback: Gemini도 실패하면 도움말 ───
         help_text = (
             "💊 DMF Intelligence\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            "의약품안전나라 DMF 데이터를\n"
+            "의약품안전나라 DMF 등록 현황을\n"
             "실시간으로 조회·분석합니다.\n\n"
-            "아래 버튼을 누르거나 직접 입력하세요!\n\n"
-            "💡 입력 예시:\n"
-            "• 세파클러 → 제조원 현황\n"
-            "• 세파클러 연계심사 → 연계 제조원만\n"
-            "• 휴시드 → 신청인 검색\n"
-            "• 인도 → 국가별 DMF 현황\n"
-            "• 인도 vs 중국 → 국가 비교\n"
-            "• 성분 랭킹 → TOP 10 성분\n"
-            "• 2월9일부터 오늘까지 → 기간 검색\n"
-            "• DMF가 뭐야? → 무엇이든 질문\n"
-            "• 최근 3일 → 최근 등록 현황"
+            "👇 아래 버튼을 눌러보세요!"
         )
         return JSONResponse(kakao_quick_replies(help_text, [
             {"messageText": "주간", "action": "message", "label": "📋 주간 현황"},
             {"messageText": "월간", "action": "message", "label": "📊 월간 리포트"},
-            {"messageText": "최근 3일", "action": "message", "label": "📅 최근 3일"},
-            {"messageText": "인도", "action": "message", "label": "🇮🇳 인도 DMF"}
+            {"messageText": "최근 3일", "action": "message", "label": "📅 최근 등록"},
+            {"messageText": "인도", "action": "message", "label": "🇮🇳 인도 DMF"},
+            {"messageText": "중국", "action": "message", "label": "🇨🇳 중국 DMF"},
+            {"messageText": "세파클러", "action": "message", "label": "💊 세파클러 검색"},
+            {"messageText": "요약", "action": "message", "label": "💬 채팅 공유용"},
+            {"messageText": "DMF가 뭐야?", "action": "message", "label": "❓ DMF란?"}
         ]))
 
     except Exception as e:
