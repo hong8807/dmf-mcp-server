@@ -61,6 +61,14 @@ def _download_dmf_excel() -> str:
 def _load_and_prepare(excel_path: str) -> pd.DataFrame:
     """엑셀 로드 + 기본 전처리"""
     df = pd.read_excel(excel_path)
+
+    # NaN 처리 (빈 칸을 빈 문자열로 변환)
+    text_cols = ['성분명', '신청인', '제조소명', '제조국가', '등록번호',
+                 '취소/취하구분', '연계심사문서번호']
+    for col in text_cols:
+        if col in df.columns:
+            df[col] = df[col].fillna('')
+
     df['최초등록일자'] = pd.to_datetime(df['최초등록일자'], errors='coerce')
 
     df['is_허여'] = df['등록번호'].astype(str).str.contains(r'\(', na=False)
@@ -69,7 +77,7 @@ def _load_and_prepare(excel_path: str) -> pd.DataFrame:
     df['base_dmf'] = df['등록번호'].astype(str).apply(
         lambda x: x.split('(', 1)[0] if '(' in x else x
     )
-    has_linked = df['연계심사문서번호'].notna() & (df['연계심사문서번호'].astype(str).str.strip() != '')
+    has_linked = (df['연계심사문서번호'].astype(str).str.strip() != '')
     linked_bases = set(df.loc[has_linked, 'base_dmf'])
     df['has_연계심사'] = df['base_dmf'].isin(linked_bases)
 
