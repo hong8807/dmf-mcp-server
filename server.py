@@ -49,7 +49,8 @@ import threading
 _cache = {
     "df": None,           # 캐싱된 DataFrame
     "last_updated": None, # 마지막 업데이트 시각
-    "loading": False      # 로딩 중 여부
+    "loading": False,     # 로딩 중 여부
+    "digest": None        # Gemini용 데이터 요약
 }
 CACHE_TTL = timedelta(hours=24)  # 하루 1회 갱신
 
@@ -86,6 +87,7 @@ def _get_cached_data() -> pd.DataFrame:
         df = _load_and_prepare(excel_path)
         _cache["df"] = df
         _cache["last_updated"] = now
+        _cache["digest"] = _build_data_digest(df)
         logger.info(f"✅ 캐시 갱신 완료 ({len(df)}건)")
         return df
     finally:
@@ -128,6 +130,163 @@ def _load_and_prepare(excel_path: str) -> pd.DataFrame:
 
     active = df[df['취소/취하구분'] == '정상'].copy()
     return active
+
+
+def _build_data_digest(df: pd.DataFrame) -> str:
+    """Gemini 컨텍스트용 DMF 데이터 통계 요약 생성 (캐시 갱신 시 1회 호출)"""
+    today = datetime.today()
+    lines = []
+
+    lines.append(f"[DMF 데이터 요약] 기준일: {today.strftime('%Y-%m-%d')}")
+    lines.append(f"총 정상 DMF 등록건수: {len(df)}건")
+
+    # 최초등록 vs 허여
+    initial = int((~df['is_허여']).sum())
+    change = int(df['is_허여'].sum())
+    linked = int(df['has_연계심사'].sum())
+    lines.append(f"최초등록: {initial}건 / 허여(변경): {change}건 / 연계심사: {linked}건")
+
+    # 상위 성분 TOP 20
+    top_ing = df['성분명'].value_counts().head(20)
+    lines.append("\n[상위 성분 TOP 20]")
+    for name, cnt in top_ing.items():
+        lines.append(f"  {name}: {cnt}건")
+
+    # 국가별 분포
+    country_dist = Counter()
+    for c in df['제조국가'].dropna():
+        for cc in str(c).split('@'):
+            country_dist[cc.strip()] += 1
+    lines.append("\n[국가별 분포]")
+    for country, cnt in country_dist.most_common(20):
+        pct = cnt / len(df) * 100
+        lines.append(f"  {country}: {cnt}건 ({pct:.1f}%)")
+
+    # 상위 신청인 TOP 20
+    top_app = df['신청인'].value_counts().head(20)
+    lines.append("\n[상위 신청인 TOP 20]")
+    for name, cnt in top_app.items():
+        if name:
+            lines.append(f"  {name}: {cnt}건")
+
+    # 상위 제조소 TOP 20
+    top_mfr = df['제조소명'].value_counts().head(20)
+    lines.append("\n[상위 제조소 TOP 20]")
+    for name, cnt in top_mfr.items():
+        if name:
+            lines.append(f"  {name}: {cnt}건")
+
+    # 최근 12개월 월별 등록 추이
+    lines.append("\n[월별 등록 추이 (최근 12개월)]")
+    for i in range(12, 0, -1):
+        m_end = today.replace(day=1) - timedelta(days=1)
+        for _ in range(i - 1):
+            m_end = m_end.replace(day=1) - timedelta(days=1)
+        m_start = m_end.replace(day=1)
+        mask = (df['최초등록일자'] >= pd.Timestamp(m_start)) & \
+               (df['최초등록일자'] <= pd.Timestamp(m_end))
+        cnt = int(mask.sum())
+        if cnt > 0:
+            lines.append(f"  {m_start.strftime('%Y-%m')}: {cnt}건")
+
+    # 최근 7일 등록
+    week_ago = today - timedelta(days=7)
+    recent_mask = df['최초등록일자'] >= pd.Timestamp(week_ago)
+    recent_cnt = int(recent_mask.sum())
+    lines.append(f"\n[최근 7일 신규등록]: {recent_cnt}건")
+
+    return "\n".join(lines)
+
+
+def compare_countries(country_a: str, country_b: str) -> dict:
+    """두 국가 DMF 등록 현황 비교"""
+    try:
+        active = _get_cached_data()
+        today = datetime.today()
+        three_months_ago = today - timedelta(days=90)
+
+        results = {}
+        for country in [country_a, country_b]:
+            mask = active['제조국가'].astype(str).str.contains(country, case=False, na=False)
+            found = active[mask]
+            recent = found[found['최초등록일자'] >= pd.Timestamp(three_months_ago)]
+
+            top_ing = found['성분명'].value_counts().head(5)
+            top_mfr = found['제조소명'].value_counts().head(5)
+
+            results[country] = {
+                "전체_등록건수": len(found),
+                "최근3개월_신규": len(recent),
+                "최초등록": int((~found['is_허여']).sum()),
+                "허여_변경": int(found['is_허여'].sum()),
+                "연계심사": int(found['has_연계심사'].sum()),
+                "주요_성분": [{"성분명": n, "건수": int(c)} for n, c in top_ing.items()],
+                "주요_제조소": [{"제조소": n, "건수": int(c)} for n, c in top_mfr.items()]
+            }
+
+        return {
+            "비교_국가": [country_a, country_b],
+            country_a: results[country_a],
+            country_b: results[country_b]
+        }
+    except Exception as e:
+        logger.error(f"국가 비교 실패: {e}")
+        raise
+
+
+def get_top_rankings(category: str, top_n: int = 10, period_months: int = None) -> dict:
+    """카테고리별 상위 랭킹 조회"""
+    try:
+        active = _get_cached_data()
+
+        # 기간 필터
+        if period_months:
+            cutoff = datetime.today() - timedelta(days=period_months * 30)
+            filtered = active[active['최초등록일자'] >= pd.Timestamp(cutoff)]
+            period_label = f"최근 {period_months}개월"
+        else:
+            filtered = active
+            period_label = "전체"
+
+        col_map = {
+            'ingredient': '성분명',
+            'country': '제조국가',
+            'applicant': '신청인',
+            'manufacturer': '제조소명'
+        }
+
+        col = col_map.get(category)
+        if not col:
+            return {"error": f"지원하지 않는 카테고리: {category}. 가능: ingredient, country, applicant, manufacturer"}
+
+        if category == 'country':
+            counts = Counter()
+            for c in filtered[col].dropna():
+                for cc in str(c).split('@'):
+                    cc = cc.strip()
+                    if cc:
+                        counts[cc] += 1
+        else:
+            counts = Counter()
+            for val in filtered[col].dropna():
+                val = str(val).strip()
+                if val:
+                    counts[val] += 1
+
+        rankings = [
+            {"순위": i + 1, "이름": name, "건수": cnt}
+            for i, (name, cnt) in enumerate(counts.most_common(top_n))
+        ]
+
+        return {
+            "카테고리": category,
+            "기간": period_label,
+            "총_대상수": len(counts),
+            "상위_목록": rankings
+        }
+    except Exception as e:
+        logger.error(f"랭킹 조회 실패: {e}")
+        raise
 
 
 # ─── 분석 함수들 (JSON dict 반환) ───
@@ -951,124 +1110,263 @@ def format_date_range_for_kakao(data: dict) -> str:
     return "\n".join(lines)
 
 
-def parse_intent_with_gemini(utterance: str) -> tuple:
+# ═══════════════════════════════════════════
+# Gemini Function Calling 도구 정의
+# ═══════════════════════════════════════════
+
+GEMINI_TOOLS = [{
+    "function_declarations": [
+        {
+            "name": "analyze_weekly_dmf",
+            "description": "주간 DMF 등록 현황을 조회합니다. '주간', '이번주', '금주' 등의 요청에 사용합니다.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "weeks_ago": {"type": "integer", "description": "몇 주 전 (1=지난주, 0=이번주)"}
+                }
+            }
+        },
+        {
+            "name": "analyze_monthly_dmf",
+            "description": "월간 DMF 등록 현황을 조회합니다. '월간', '이번달', '전월' 등의 요청에 사용합니다.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "months_ago": {"type": "integer", "description": "몇 개월 전 (1=전월)"}
+                }
+            }
+        },
+        {
+            "name": "search_ingredient",
+            "description": "성분명으로 DMF 등록 현황을 검색합니다. 제조원, 연계심사 현황을 포함합니다.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "ingredient": {"type": "string", "description": "검색할 성분명 (부분 매칭)"},
+                    "linked_filter": {"type": "string", "description": "연계심사 필터: linked(연계만), unlinked(미연계만), null(전체)", "enum": ["linked", "unlinked"]}
+                },
+                "required": ["ingredient"]
+            }
+        },
+        {
+            "name": "search_country",
+            "description": "특정 국가의 DMF 등록 현황을 검색합니다.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "country": {"type": "string", "description": "국가명 (한국어: 인도, 중국, 미국 등)"}
+                },
+                "required": ["country"]
+            }
+        },
+        {
+            "name": "search_applicant",
+            "description": "신청인(수입사)별 DMF 등록 현황을 검색합니다.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "applicant": {"type": "string", "description": "신청인명 (부분 매칭)"},
+                    "month": {"type": "integer", "description": "특정 월 필터 (1-12, 선택)"}
+                },
+                "required": ["applicant"]
+            }
+        },
+        {
+            "name": "search_manufacturer",
+            "description": "제조소명으로 DMF 등록 현황을 검색합니다.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "keyword": {"type": "string", "description": "제조소명 (부분 매칭)"}
+                },
+                "required": ["keyword"]
+            }
+        },
+        {
+            "name": "search_date_range",
+            "description": "특정 기간 내 DMF 등록 현황을 검색합니다. '오늘', '어제', '최근 N일', '2월 9일부터 오늘까지' 등.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "start_date": {"type": "string", "description": "시작일 (YYYY-MM-DD)"},
+                    "end_date": {"type": "string", "description": "종료일 (YYYY-MM-DD)"}
+                },
+                "required": ["start_date", "end_date"]
+            }
+        },
+        {
+            "name": "compare_countries",
+            "description": "두 국가의 DMF 등록 현황을 비교합니다. '인도 vs 중국', '인도와 중국 비교' 등.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "country_a": {"type": "string", "description": "첫 번째 국가명"},
+                    "country_b": {"type": "string", "description": "두 번째 국가명"}
+                },
+                "required": ["country_a", "country_b"]
+            }
+        },
+        {
+            "name": "get_top_rankings",
+            "description": "카테고리별 상위 랭킹을 조회합니다. '가장 많이 등록된 성분 TOP 10', '주요 국가 순위' 등.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "category": {"type": "string", "description": "카테고리", "enum": ["ingredient", "country", "applicant", "manufacturer"]},
+                    "top_n": {"type": "integer", "description": "상위 N개 (기본 10)"},
+                    "period_months": {"type": "integer", "description": "최근 N개월 필터 (선택, 없으면 전체 기간)"}
+                },
+                "required": ["category"]
+            }
+        },
+        {
+            "name": "generate_chat_summary",
+            "description": "카카오톡 공유용 간결한 DMF 주간 요약 텍스트를 생성합니다."
+        }
+    ]
+}]
+
+
+def _execute_gemini_function(name: str, args: dict) -> str:
+    """Gemini가 요청한 함수를 실행하고 JSON 문자열로 반환"""
+    try:
+        if name == 'analyze_weekly_dmf':
+            result = analyze_weekly_dmf(args.get('weeks_ago', 1))
+        elif name == 'analyze_monthly_dmf':
+            result = analyze_monthly_dmf(args.get('months_ago', 1))
+        elif name == 'search_ingredient':
+            result = search_ingredient(args['ingredient'], args.get('linked_filter'))
+        elif name == 'search_country':
+            result = search_country(args['country'])
+        elif name == 'search_applicant':
+            result = search_applicant(args['applicant'], args.get('month'))
+        elif name == 'search_manufacturer':
+            result = search_manufacturer(args['keyword'])
+        elif name == 'search_date_range':
+            start = datetime.strptime(args['start_date'], '%Y-%m-%d')
+            end = datetime.strptime(args['end_date'], '%Y-%m-%d')
+            result = search_date_range(start, end)
+        elif name == 'compare_countries':
+            result = compare_countries(args['country_a'], args['country_b'])
+        elif name == 'get_top_rankings':
+            result = get_top_rankings(args['category'], args.get('top_n', 10), args.get('period_months'))
+        elif name == 'generate_chat_summary':
+            return generate_chat_summary()
+        else:
+            return json.dumps({"error": f"알 수 없는 함수: {name}"}, ensure_ascii=False)
+        return json.dumps(result, ensure_ascii=False, default=str)
+    except Exception as e:
+        return json.dumps({"error": str(e)}, ensure_ascii=False)
+
+
+def handle_with_gemini(utterance: str) -> Optional[str]:
     """
-    Gemini Flash로 사용자 발화 의도 분석
-    실패 시 None 반환 → regex fallback
+    Gemini 2.0 Flash Function Calling + 자연어 응답 생성
+
+    Flow:
+    1. 사용자 메시지 + 데이터 요약 + 도구 선언을 Gemini에 전송
+    2. Gemini가 function_call 반환 → 로컬 실행 → 결과를 Gemini에 다시 전송
+    3. Gemini가 자연어 응답 생성 → 반환
+    4. 실패 시 None → regex fallback
+
+    Returns: 카카오톡용 텍스트 응답 또는 None
     """
     api_key = os.environ.get("GEMINI_API_KEY", "")
     if not api_key:
         return None
 
     today = datetime.today()
-    today_str = today.strftime('%Y-%m-%d')
+    digest = _cache.get("digest", "데이터 로딩 중")
 
-    prompt = f"""당신은 의약품 DMF(Drug Master File) 챗봇의 인텐트 분류기입니다.
-오늘 날짜: {today_str}
+    system_prompt = f"""당신은 DMF Intelligence, 한국 의약품안전나라의 DMF(Drug Master File) 등록 데이터 전문 AI 어시스턴트입니다.
 
-사용자 입력을 분석하여 아래 JSON 형식으로만 응답하세요. 설명 없이 JSON만 출력하세요.
+규칙:
+1. 항상 한국어로 응답하세요.
+2. 응답은 3500자 이내로 유지하세요 (카카오톡 제한).
+3. 데이터 조회가 필요하면 제공된 도구(함수)를 호출하세요.
+4. 일반적인 DMF 지식 질문은 도구 없이 직접 답변하세요.
+5. 아래 데이터 요약을 참고하여 분석/비교/랭킹 질문에 답할 수 있습니다.
+6. 이모지를 적절히 사용하되 과하지 않게 하세요.
+7. 출처: 의약품안전나라를 응답 끝에 포함하세요.
+8. 모르는 것은 솔직히 모른다고 하세요.
 
-가능한 intent:
-- "help": 인사, 도움말, 사용법 질문
-- "weekly": 주간 현황 요청
-- "monthly": 월간 현황 요청
-- "summary": 요약/공유용 텍스트 요청
-- "date_range": 특정 기간 DMF 현황 (start_date, end_date 포함, YYYY-MM-DD 형식)
-- "ingredient": 성분명/제조소/신청인 검색 (keyword 포함)
-- "country": 국가별 DMF 현황 (country 포함)
-- "applicant": 신청인 지정 검색 (applicant + 선택적 month 포함)
+오늘 날짜: {today.strftime('%Y-%m-%d')}
 
-추가 파라미터:
-- keyword: 검색할 핵심 단어 (조사/불필요 단어 제거)
-- linked_filter: "linked" (연계심사 된 것만), "unlinked" (미연계만), null (전체)
-- month: 월 숫자 (없으면 null)
-- start_date, end_date: 기간 (YYYY-MM-DD, date_range일 때만)
-- country: 국가명 (country일 때만)
-- applicant: 신청인명 (applicant일 때만)
+데이터 요약:
+{digest}"""
 
-예시:
-입력: "클래리 연계심사 된 제조원" → {{"intent":"ingredient","keyword":"클래리","linked_filter":"linked"}}
-입력: "2월9일부터 오늘까지 dmf현황" → {{"intent":"date_range","start_date":"{today.year}-02-09","end_date":"{today_str}"}}
-입력: "1월에 파마피아 등록현황" → {{"intent":"applicant","applicant":"파마피아","month":1}}
-입력: "파마피아" → {{"intent":"ingredient","keyword":"파마피아"}}
-입력: "인도 DMF 현황" → {{"intent":"country","country":"인도"}}
-입력: "오늘 신규 등록" → {{"intent":"date_range","start_date":"{today_str}","end_date":"{today_str}"}}
-입력: "최근 5일 등록 현황" → {{"intent":"date_range","start_date":"{(today - timedelta(days=5)).strftime('%Y-%m-%d')}","end_date":"{today_str}"}}
-입력: "Synthimed 제조소 검색" → {{"intent":"ingredient","keyword":"Synthimed"}}
-입력: "세파클러 중 연계 안된 제조원 알려줘" → {{"intent":"ingredient","keyword":"세파클러","linked_filter":"unlinked"}}
-입력: "신청인 국전약품 1월" → {{"intent":"applicant","applicant":"국전약품","month":1}}
-
-사용자 입력: "{utterance}"
-"""
+    api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={api_key}"
 
     try:
-        resp = requests.post(
-            f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={api_key}",
-            json={
-                "contents": [{"parts": [{"text": prompt}]}],
-                "generationConfig": {
-                    "temperature": 0,
-                    "maxOutputTokens": 200
-                }
-            },
-            timeout=3  # 카카오 5초 제한 고려
-        )
+        # Step 1: 사용자 메시지 + 도구 전송
+        resp = requests.post(api_url, json={
+            "system_instruction": {"parts": [{"text": system_prompt}]},
+            "contents": [{"role": "user", "parts": [{"text": utterance}]}],
+            "tools": GEMINI_TOOLS,
+            "generationConfig": {"temperature": 0.3, "maxOutputTokens": 1000}
+        }, timeout=3.5)
 
         if resp.status_code != 200:
             logger.warning(f"Gemini API 실패: {resp.status_code}")
             return None
 
         result = resp.json()
-        text_response = result['candidates'][0]['content']['parts'][0]['text']
+        candidate = result['candidates'][0]['content']
+        parts = candidate.get('parts', [])
 
-        # JSON 추출 (```json ... ``` 또는 순수 JSON)
-        json_match = re.search(r'\{[^{}]+\}', text_response)
-        if not json_match:
-            logger.warning(f"Gemini JSON 파싱 실패: {text_response}")
+        if not parts:
             return None
 
-        parsed = json.loads(json_match.group())
-        intent = parsed.get('intent', 'help')
+        # Case A: Gemini가 직접 텍스트로 응답 (도구 호출 불필요)
+        if 'text' in parts[0]:
+            text = parts[0]['text'].strip()
+            if len(text) > 3500:
+                text = text[:3450] + "\n\n... (응답이 잘렸습니다)"
+            logger.info(f"🤖 Gemini 직접 응답 ({len(text)}자)")
+            return text
 
-        # intent별 params 구성
-        if intent == 'date_range':
-            start_str = parsed.get('start_date', today_str)
-            end_str = parsed.get('end_date', today_str)
-            try:
-                start = datetime.strptime(start_str, '%Y-%m-%d')
-                end = datetime.strptime(end_str, '%Y-%m-%d')
-            except:
-                start = end = today
-            return ('date_range', {'start': start, 'end': end})
+        # Case B: Gemini가 함수 호출 요청
+        if 'functionCall' in parts[0]:
+            fc = parts[0]['functionCall']
+            fn_name = fc['name']
+            fn_args = fc.get('args', {})
+            logger.info(f"🔧 Gemini 함수 호출: {fn_name}({fn_args})")
 
-        elif intent == 'ingredient':
-            return ('ingredient', {
-                'ingredient': parsed.get('keyword', ''),
-                'linked_filter': parsed.get('linked_filter'),
-                'month': parsed.get('month')
-            })
+            # 함수 실행
+            fn_result = _execute_gemini_function(fn_name, fn_args)
 
-        elif intent == 'applicant':
-            return ('applicant', {
-                'applicant': parsed.get('applicant', parsed.get('keyword', '')),
-                'month': parsed.get('month')
-            })
+            # Step 2: 함수 결과를 Gemini에 보내서 자연어 응답 생성
+            resp2 = requests.post(api_url, json={
+                "system_instruction": {"parts": [{"text": system_prompt}]},
+                "contents": [
+                    {"role": "user", "parts": [{"text": utterance}]},
+                    {"role": "model", "parts": [{"functionCall": {"name": fn_name, "args": fn_args}}]},
+                    {"role": "user", "parts": [{"functionResponse": {"name": fn_name, "response": {"result": fn_result}}}]}
+                ],
+                "tools": GEMINI_TOOLS,
+                "generationConfig": {"temperature": 0.3, "maxOutputTokens": 1000}
+            }, timeout=3.5)
 
-        elif intent == 'country':
-            return ('country', {
-                'country': parsed.get('country', parsed.get('keyword', ''))
-            })
+            if resp2.status_code != 200:
+                logger.warning(f"Gemini 2차 응답 실패: {resp2.status_code}")
+                return None
 
-        elif intent in ('weekly', 'monthly', 'summary', 'help'):
-            return (intent, {})
+            result2 = resp2.json()
+            parts2 = result2['candidates'][0]['content'].get('parts', [])
+            if parts2 and 'text' in parts2[0]:
+                text = parts2[0]['text'].strip()
+                if len(text) > 3500:
+                    text = text[:3450] + "\n\n... (응답이 잘렸습니다)"
+                logger.info(f"🤖 Gemini 함수 기반 응답 ({len(text)}자)")
+                return text
 
         return None
 
     except requests.Timeout:
-        logger.warning("Gemini API 타임아웃 (3초)")
+        logger.warning("Gemini API 타임아웃")
         return None
     except Exception as e:
-        logger.warning(f"Gemini 인텐트 분석 실패: {e}")
+        logger.warning(f"Gemini 대화 처리 실패: {e}")
         return None
 
 
@@ -1239,15 +1537,13 @@ async def kakao_skill_handler(request: Request):
                 "🔄 서버가 준비 중입니다.\n10초 후 다시 시도해주세요!"
             ))
 
-        intent, extracted = parse_user_intent(utterance)
+        # ═══════════════════════════════════════
+        # 3-Tier 라우팅
+        # ═══════════════════════════════════════
 
-        # Gemini AI 인텐트 분석 시도 → 실패 시 regex 결과 사용
-        gemini_result = parse_intent_with_gemini(utterance)
-        if gemini_result:
-            intent, extracted = gemini_result
-            logger.info(f"🤖 Gemini: intent={intent}, params={extracted}")
-        else:
-            logger.info(f"📏 Regex: intent={intent}, params={extracted}")
+        # ─── Tier 1: Regex 빠른 경로 (<100ms) ───
+        intent, extracted = parse_user_intent(utterance)
+        logger.info(f"📏 Regex: intent={intent}, params={extracted}")
 
         if intent == 'weekly':
             data = analyze_weekly_dmf()
@@ -1298,7 +1594,7 @@ async def kakao_skill_handler(request: Request):
             applicant = extracted.get('applicant', params.get('applicant', ''))
             month = extracted.get('month')
             if not applicant:
-                return JSONResponse(kakao_simple_text("검색할 신청인명을 입력해주세요.\n\n예: 신청인 파마피아\n예: 1월에 신청인 국전약품 현황"))
+                return JSONResponse(kakao_simple_text("검색할 신청인명을 입력해주세요.\n\n예: 신청인 휴시드\n예: 1월에 신청인 국전약품 현황"))
             data = search_applicant(applicant, month)
             text = format_applicant_for_kakao(data)
             return JSONResponse(kakao_quick_replies(text, [
@@ -1311,7 +1607,7 @@ async def kakao_skill_handler(request: Request):
             keyword = extracted.get('ingredient', params.get('ingredient', ''))
             linked_filter = extracted.get('linked_filter')
             if not keyword:
-                return JSONResponse(kakao_simple_text("검색어를 입력해주세요.\n\n예: 클래리, Synthimed, 파마피아"))
+                return JSONResponse(kakao_simple_text("검색어를 입력해주세요.\n\n예: 클래리, Synthimed, 휴시드"))
 
             # 연계 필터가 있으면 성분명 검색 고정
             if linked_filter:
@@ -1356,36 +1652,45 @@ async def kakao_skill_handler(request: Request):
                 ]))
 
             else:
-                return JSONResponse(kakao_quick_replies(
-                    f"🔍 '{keyword}' 검색 결과\n\n성분명·신청인·제조소에서\n일치하는 항목이 없습니다.\n\n다른 키워드로 검색해보세요.",
-                    [
-                        {"messageText": "주간", "action": "message", "label": "📋 주간 현황"},
-                        {"messageText": "도움", "action": "message", "label": "❓ 메뉴"}
-                    ]
-                ))
+                # 통합 검색 실패 → Tier 2/3으로 전달
+                pass
 
-        else:  # help
-            help_text = (
-                "💊 DMF Intelligence\n"
-                "━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                "의약품안전나라 DMF 데이터를\n"
-                "실시간으로 조회·분석합니다.\n\n"
-                "아래 버튼을 누르거나 직접 입력하세요!\n\n"
-                "💡 입력 예시:\n"
-                "• 세파클러 → 제조원 현황\n"
-                "• 세파클러 연계심사 → 연계 제조원만\n"
-                "• 파마피아 → 신청인 검색\n"
-                "• 인도 → 국가별 DMF 현황\n"
-                "• 2월9일부터 오늘까지 → 기간 검색\n"
-                "• 오늘 등록 → 당일 현황\n"
-                "• 최근 3일 → 최근 등록 현황"
-            )
-            return JSONResponse(kakao_quick_replies(help_text, [
+        # ─── Tier 2/3: Gemini 대화형 (intent == 'help' 또는 검색 실패) ───
+        # Gemini Function Calling + 자연어 응답 생성
+        gemini_response = handle_with_gemini(utterance)
+        if gemini_response:
+            logger.info(f"🤖 Gemini 대화형 응답 사용")
+            return JSONResponse(kakao_quick_replies(gemini_response, [
                 {"messageText": "주간", "action": "message", "label": "📋 주간 현황"},
                 {"messageText": "월간", "action": "message", "label": "📊 월간 리포트"},
                 {"messageText": "최근 3일", "action": "message", "label": "📅 최근 3일"},
-                {"messageText": "인도", "action": "message", "label": "🇮🇳 인도 DMF"}
+                {"messageText": "도움", "action": "message", "label": "❓ 메뉴"}
             ]))
+
+        # ─── Fallback: Gemini도 실패하면 도움말 ───
+        help_text = (
+            "💊 DMF Intelligence\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "의약품안전나라 DMF 데이터를\n"
+            "실시간으로 조회·분석합니다.\n\n"
+            "아래 버튼을 누르거나 직접 입력하세요!\n\n"
+            "💡 입력 예시:\n"
+            "• 세파클러 → 제조원 현황\n"
+            "• 세파클러 연계심사 → 연계 제조원만\n"
+            "• 휴시드 → 신청인 검색\n"
+            "• 인도 → 국가별 DMF 현황\n"
+            "• 인도 vs 중국 → 국가 비교\n"
+            "• 성분 랭킹 → TOP 10 성분\n"
+            "• 2월9일부터 오늘까지 → 기간 검색\n"
+            "• DMF가 뭐야? → 무엇이든 질문\n"
+            "• 최근 3일 → 최근 등록 현황"
+        )
+        return JSONResponse(kakao_quick_replies(help_text, [
+            {"messageText": "주간", "action": "message", "label": "📋 주간 현황"},
+            {"messageText": "월간", "action": "message", "label": "📊 월간 리포트"},
+            {"messageText": "최근 3일", "action": "message", "label": "📅 최근 3일"},
+            {"messageText": "인도", "action": "message", "label": "🇮🇳 인도 DMF"}
+        ]))
 
     except Exception as e:
         logger.error(f"❌ 카카오 스킬 처리 실패: {e}")
