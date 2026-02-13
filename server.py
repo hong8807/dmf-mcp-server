@@ -447,6 +447,77 @@ def search_applicant(applicant: str, month: int = None) -> dict:
         raise
 
 
+def search_manufacturer(keyword: str) -> dict:
+    """제조소명으로 DMF 검색"""
+    try:
+        active = _get_cached_data()
+
+        mask = active['제조소명'].astype(str).str.contains(keyword, case=False, na=False)
+        found = active[mask].sort_values('최초등록일자', ascending=False)
+
+        if len(found) == 0:
+            return {"검색_제조소": keyword, "메시지": f"'{keyword}' 관련 제조소 없음", "총건수": 0}
+
+        found_copy = found.copy()
+        found_copy['base_dmf'] = found_copy['등록번호'].astype(str).apply(
+            lambda x: x.split('(')[0] if '(' in x else x
+        )
+
+        # 성분별 현황
+        ingredient_list = []
+        for name, group in found_copy.groupby('성분명'):
+            mfr_count = group['base_dmf'].nunique()
+            linked_count = group[group['has_연계심사']]['base_dmf'].nunique()
+            applicants = group['신청인'].unique().tolist()
+
+            ingredient_list.append({
+                "성분명": str(name),
+                "제조원수": mfr_count,
+                "연계심사_수": linked_count,
+                "신청인": [a for a in applicants if a][:3]
+            })
+
+        # 국가 정보
+        country_dist = Counter()
+        for _, row in found_copy.drop_duplicates('base_dmf').iterrows():
+            main_country = str(row['제조국가']).split('@')[0]
+            country_dist[main_country] += 1
+
+        return {
+            "검색_제조소": keyword,
+            "총_등록건수": len(found),
+            "취급_성분수": len(ingredient_list),
+            "국가별_분포": [{"국가": k, "건수": v} for k, v in country_dist.most_common()],
+            "성분별_현황": sorted(ingredient_list, key=lambda x: x['제조원수'], reverse=True)
+        }
+    except Exception as e:
+        logger.error(f"제조소 검색 실패: {e}")
+        raise
+
+
+def search_universal(keyword: str, month: int = None) -> tuple:
+    """
+    통합 검색: 성분명 → 신청인 → 제조소명 순서로 검색
+    Returns: (search_type, data) 튜플
+        search_type: 'ingredient' | 'applicant' | 'manufacturer' | 'none'
+    """
+    active = _get_cached_data()
+
+    # 1순위: 성분명
+    if active['성분명'].astype(str).str.contains(keyword, case=False, na=False).any():
+        return ('ingredient', None)  # 기존 search_ingredient 사용
+
+    # 2순위: 신청인
+    if active['신청인'].astype(str).str.contains(keyword, case=False, na=False).any():
+        return ('applicant', search_applicant(keyword, month))
+
+    # 3순위: 제조소명
+    if active['제조소명'].astype(str).str.contains(keyword, case=False, na=False).any():
+        return ('manufacturer', search_manufacturer(keyword))
+
+    return ('none', None)
+
+
 def generate_chat_summary() -> str:
     """카카오톡 공유용 간결한 요약 메시지"""
     try:
@@ -689,17 +760,14 @@ def format_ingredient_for_kakao(data: dict) -> str:
 
         lines.append(f"   제조원 {ig['제조원수']}개 (연계 {ig['연계심사_수']}개)")
 
-        # 제조원 목록
-        for m in ig.get("제조원_목록", [])[:8]:
+        # 제조원 목록 (전체 표시, 1줄로 압축)
+        for m in ig.get("제조원_목록", []):
             linked_mark = "✅" if m['연계심사'] else "⬜"
-            status_mark = " ❌" if m['상태'] != '정상' else ""
-            heo = f" +{m['허여_수']}허여" if m['허여_수'] > 0 else ""
-            lines.append(f"  {linked_mark} {m['제조소'][:22]}")
-            lines.append(f"     {m['국가']} | {m['신청인'][:10]}{heo}{status_mark}")
-
-        remaining = len(ig.get("제조원_목록", [])) - 8
-        if remaining > 0:
-            lines.append(f"     ... 외 {remaining}개 제조원")
+            status_mark = "❌" if m['상태'] != '정상' else ""
+            heo = f"+{m['허여_수']}허여" if m['허여_수'] > 0 else ""
+            country = m['국가'].split('/')[0]  # 첫 번째 국가만
+            lines.append(f"  {linked_mark} {m['제조소'][:20]} ({country})")
+            lines.append(f"     {m['신청인'][:12]} {heo}{status_mark}")
 
     lines.append(f"\n{'─'*24}")
     lines.append("출처: 의약품안전나라")
@@ -768,6 +836,39 @@ def format_applicant_for_kakao(data: dict) -> str:
     return "\n".join(lines)
 
 
+def format_manufacturer_for_kakao(data: dict) -> str:
+    """제조소 검색 결과를 카카오톡 메시지 형태로 포맷"""
+    if data.get("총건수", 0) == 0:
+        return f"🏭 '{data['검색_제조소']}' 검색 결과\n\n{data.get('메시지', '등록 없음')}"
+
+    lines = [
+        f"🏭 '{data['검색_제조소']}' 제조소 현황",
+        f"{'─'*24}",
+        f"📋 총 {data['총_등록건수']}건 | 취급 성분 {data['취급_성분수']}종",
+    ]
+
+    country_dist = data.get("국가별_분포", [])
+    if country_dist:
+        dist_str = " | ".join([f"{c['국가']} {c['건수']}" for c in country_dist[:4]])
+        lines.append(f"🌍 {dist_str}")
+
+    lines.append(f"{'─'*24}")
+
+    ingredients = data.get("성분별_현황", [])
+    if ingredients:
+        for item in ingredients[:12]:
+            linked_mark = f"✅{item['연계심사_수']}" if item['연계심사_수'] > 0 else "⬜0"
+            apps = ", ".join(item.get('신청인', [])[:2])
+            lines.append(f"💊 {item['성분명'][:20]}")
+            lines.append(f"   제조원 {item['제조원수']}개 | 연계 {linked_mark} | {apps[:15]}")
+
+    if len(ingredients) > 12:
+        lines.append(f"\n... 외 {len(ingredients) - 12}개 성분")
+
+    lines.append("\n출처: 의약품안전나라")
+    return "\n".join(lines)
+
+
 def parse_user_intent(utterance: str) -> tuple:
     """
     사용자 발화를 분석하여 의도와 파라미터 추출
@@ -828,7 +929,7 @@ def parse_user_intent(utterance: str) -> tuple:
     if any(kw in text for kw in ['도움', '사용법', '안내', '메뉴', '뭘 할 수', '기능', '명령', '뭐 할', '뭘 물', '어떻게']):
         return ('help', {})
 
-    # 성분명 검색 (연계심사 필터 포함)
+    # 성분명/통합 검색 (연계심사 필터 + 월 필터 포함)
     # 연계심사 필터 감지
     linked_filter = None
     if any(kw in text for kw in ['연계 안', '미연계', '연계안', '비연계', '연계 없']):
@@ -836,23 +937,30 @@ def parse_user_intent(utterance: str) -> tuple:
     elif any(kw in text for kw in ['연계심사', '연계', 'linked']):
         linked_filter = 'linked'
 
-    # 성분명 추출 (키워드 제거)
+    # 월 추출 (여기서도 체크 — 신청인 인텐트에서 못 잡았을 경우)
+    month_match = re.search(r'(\d{1,2})월', text)
+    month = int(month_match.group(1)) if month_match else None
+
+    # 검색 키워드 추출 (불필요 단어 모두 제거)
     clean_text = re.sub(
         r'\s*(?:중|에서|의|에)?\s*(?:연계심사|미연계|비연계|연계|제조원|제조사|현황|검색|조회|dmf|등록|허여|된|안된|있는|없는|몇개|갯수|수|알려줘|보여줘|뭐야)\s*',
         ' ', text
     ).strip()
-    # 남은 텍스트에서 앞뒤 공백/조사 정리
+    # 월 패턴 제거 ("1월에", "1월", "2월의" 등)
+    clean_text = re.sub(r'\d{1,2}월\s*(?:에|의|은|는)?\s*', '', clean_text).strip()
+    # 남은 조사/기호 정리
     clean_text = re.sub(r'\s+', ' ', clean_text).strip()
-    clean_text = re.sub(r'[?？]$', '', clean_text).strip()
+    clean_text = re.sub(r'[?？!]$', '', clean_text).strip()
+    clean_text = re.sub(r'(?:은|는|이|가|을|를)$', '', clean_text).strip()
 
     if clean_text and clean_text not in ['안녕', '하이', 'hi', 'hello', '시작'] and len(clean_text) > 1:
-        return ('ingredient', {'ingredient': clean_text, 'linked_filter': linked_filter})
+        return ('ingredient', {'ingredient': clean_text, 'linked_filter': linked_filter, 'month': month})
 
     # 너무 짧거나 일반적인 인사는 help로
     if len(text) <= 1 or text in ['안녕', '하이', 'hi', 'hello', '시작']:
         return ('help', {})
 
-    return ('ingredient', {'ingredient': utterance.strip(), 'linked_filter': linked_filter})
+    return ('ingredient', {'ingredient': utterance.strip(), 'linked_filter': linked_filter, 'month': month})
 
 
 # ─── 카카오 웹훅 엔드포인트들 ───
@@ -959,24 +1067,61 @@ async def kakao_skill_handler(request: Request):
             ]))
 
         elif intent == 'ingredient':
-            ingredient = extracted.get('ingredient', params.get('ingredient', ''))
+            keyword = extracted.get('ingredient', params.get('ingredient', ''))
             linked_filter = extracted.get('linked_filter')
-            if not ingredient:
-                return JSONResponse(kakao_simple_text("검색할 성분명을 입력해주세요.\n\n예: amoxicillin, tofacitinib, 소라페닙"))
-            data = search_ingredient(ingredient, linked_filter)
-            text = format_ingredient_for_kakao(data)
-            
-            # 퀵리플라이: 연계 필터 토글
-            replies = []
-            if linked_filter != 'linked':
-                replies.append({"messageText": f"{ingredient} 연계심사", "action": "message", "label": "✅ 연계심사만"})
-            if linked_filter != 'unlinked':
-                replies.append({"messageText": f"{ingredient} 미연계", "action": "message", "label": "⬜ 미연계만"})
-            if linked_filter is not None:
-                replies.append({"messageText": ingredient, "action": "message", "label": "📋 전체 보기"})
-            replies.append({"messageText": "도움", "action": "message", "label": "❓ 메뉴"})
-            
-            return JSONResponse(kakao_quick_replies(text, replies[:4]))
+            if not keyword:
+                return JSONResponse(kakao_simple_text("검색어를 입력해주세요.\n\n예: 클래리, Synthimed, 파마피아"))
+
+            # 연계 필터가 있으면 성분명 검색 고정
+            if linked_filter:
+                data = search_ingredient(keyword, linked_filter)
+                text = format_ingredient_for_kakao(data)
+                replies = []
+                if linked_filter != 'linked':
+                    replies.append({"messageText": f"{keyword} 연계심사", "action": "message", "label": "✅ 연계심사만"})
+                if linked_filter != 'unlinked':
+                    replies.append({"messageText": f"{keyword} 미연계", "action": "message", "label": "⬜ 미연계만"})
+                replies.append({"messageText": keyword, "action": "message", "label": "📋 전체 보기"})
+                replies.append({"messageText": "도움", "action": "message", "label": "❓ 메뉴"})
+                return JSONResponse(kakao_quick_replies(text, replies[:4]))
+
+            # 통합 검색: 성분명 → 신청인 → 제조소명
+            month = extracted.get('month')
+            search_type, uni_data = search_universal(keyword, month)
+
+            if search_type == 'ingredient':
+                data = search_ingredient(keyword)
+                text = format_ingredient_for_kakao(data)
+                return JSONResponse(kakao_quick_replies(text, [
+                    {"messageText": f"{keyword} 연계심사", "action": "message", "label": "✅ 연계심사만"},
+                    {"messageText": f"{keyword} 미연계", "action": "message", "label": "⬜ 미연계만"},
+                    {"messageText": "도움", "action": "message", "label": "❓ 메뉴"}
+                ]))
+
+            elif search_type == 'applicant':
+                text = format_applicant_for_kakao(uni_data)
+                return JSONResponse(kakao_quick_replies(text, [
+                    {"messageText": "주간", "action": "message", "label": "📋 주간 현황"},
+                    {"messageText": "월간", "action": "message", "label": "📊 월간 리포트"},
+                    {"messageText": "도움", "action": "message", "label": "❓ 메뉴"}
+                ]))
+
+            elif search_type == 'manufacturer':
+                text = format_manufacturer_for_kakao(uni_data)
+                return JSONResponse(kakao_quick_replies(text, [
+                    {"messageText": "주간", "action": "message", "label": "📋 주간 현황"},
+                    {"messageText": "월간", "action": "message", "label": "📊 월간 리포트"},
+                    {"messageText": "도움", "action": "message", "label": "❓ 메뉴"}
+                ]))
+
+            else:
+                return JSONResponse(kakao_quick_replies(
+                    f"🔍 '{keyword}' 검색 결과\n\n성분명·신청인·제조소에서\n일치하는 항목이 없습니다.\n\n다른 키워드로 검색해보세요.",
+                    [
+                        {"messageText": "주간", "action": "message", "label": "📋 주간 현황"},
+                        {"messageText": "도움", "action": "message", "label": "❓ 메뉴"}
+                    ]
+                ))
 
         else:  # help
             help_text = (
@@ -988,9 +1133,10 @@ async def kakao_skill_handler(request: Request):
                 "💡 입력 예시:\n"
                 "• 클래리 → 성분별 제조원 현황\n"
                 "• 클래리 연계심사 → 연계심사 제조원만\n"
-                "• amoxicillin → 영문 검색\n"
+                "• Synthimed → 제조소 검색\n"
+                "• 파마피아 → 신청인 검색\n"
                 "• 인도 → 국가별 DMF 현황\n"
-                "• 신청인 파마피아 → 신청인 현황\n"
+                "• 신청인 파마피아 → 신청인 지정 검색\n"
                 "• 1월에 신청인 국전약품 → 월별 신청인"
             )
             return JSONResponse(kakao_quick_replies(help_text, [
