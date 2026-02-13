@@ -518,6 +518,57 @@ def search_universal(keyword: str, month: int = None) -> tuple:
     return ('none', None)
 
 
+def search_date_range(start_date, end_date) -> dict:
+    """기간별 DMF 등록 현황 검색"""
+    try:
+        active = _get_cached_data()
+
+        mask = (active['최초등록일자'] >= pd.Timestamp(start_date)) & \
+               (active['최초등록일자'] <= pd.Timestamp(end_date))
+        found = active[mask].sort_values('최초등록일자', ascending=False)
+
+        period_label = f"{start_date.strftime('%m/%d')}~{end_date.strftime('%m/%d')}"
+
+        if len(found) == 0:
+            return {"기간": period_label, "메시지": f"{period_label} 기간 신규 DMF 등록 없음", "총건수": 0}
+
+        initial = int((~found['is_허여']).sum())
+        change = int(found['is_허여'].sum())
+        linked = int(found['has_연계심사'].sum())
+
+        # 국가별 분포
+        country_dist = Counter()
+        for _, row in found.iterrows():
+            main_country = str(row['제조국가']).split('@')[0]
+            country_dist[main_country] += 1
+        country_list = [{"국가": k, "건수": v} for k, v in country_dist.most_common()]
+
+        # 성분별 목록
+        ingredient_list = []
+        for name, group in found.groupby('성분명'):
+            ingredient_list.append({
+                "성분명": str(name),
+                "건수": len(group),
+                "신청인": group['신청인'].iloc[0] if len(group) > 0 else '',
+                "제조소": group['제조소명'].iloc[0][:20] if len(group) > 0 else '',
+                "국가": str(group['제조국가'].iloc[0]).split('@')[0] if len(group) > 0 else ''
+            })
+        ingredient_list.sort(key=lambda x: x['건수'], reverse=True)
+
+        return {
+            "기간": period_label,
+            "총건수": len(found),
+            "최초등록": initial,
+            "허여": change,
+            "연계심사": linked,
+            "국가별_분포": country_list,
+            "성분별_현황": ingredient_list
+        }
+    except Exception as e:
+        logger.error(f"기간 검색 실패: {e}")
+        raise
+
+
 def generate_chat_summary() -> str:
     """카카오톡 공유용 간결한 요약 메시지"""
     try:
@@ -869,86 +920,256 @@ def format_manufacturer_for_kakao(data: dict) -> str:
     return "\n".join(lines)
 
 
+def format_date_range_for_kakao(data: dict) -> str:
+    """기간별 검색 결과를 카카오톡 메시지 형태로 포맷"""
+    if data.get("총건수", 0) == 0:
+        return f"📅 {data['기간']} DMF 현황\n\n{data.get('메시지', '등록 없음')}"
+
+    lines = [
+        f"📅 {data['기간']} DMF 현황",
+        f"{'─'*24}",
+        f"총 {data['총건수']}건 (최초 {data['최초등록']} / 허여 {data['허여']})",
+        f"연계심사 {data['연계심사']}건",
+    ]
+
+    country_dist = data.get("국가별_분포", [])
+    if country_dist:
+        lines.append(f"\n🌍 국가별:")
+        for c in country_dist[:5]:
+            lines.append(f"  {c['국가']}: {c['건수']}건")
+
+    ingredients = data.get("성분별_현황", [])
+    if ingredients:
+        lines.append(f"\n💊 등록 성분:")
+        for item in ingredients[:10]:
+            lines.append(f"  {item['성분명'][:18]} ({item['국가']}) {item['신청인'][:8]}")
+
+    if len(ingredients) > 10:
+        lines.append(f"  ... 외 {len(ingredients) - 10}개")
+
+    lines.append("\n출처: 의약품안전나라")
+    return "\n".join(lines)
+
+
+def parse_intent_with_gemini(utterance: str) -> tuple:
+    """
+    Gemini Flash로 사용자 발화 의도 분석
+    실패 시 None 반환 → regex fallback
+    """
+    api_key = os.environ.get("GEMINI_API_KEY", "")
+    if not api_key:
+        return None
+
+    today = datetime.today()
+    today_str = today.strftime('%Y-%m-%d')
+
+    prompt = f"""당신은 의약품 DMF(Drug Master File) 챗봇의 인텐트 분류기입니다.
+오늘 날짜: {today_str}
+
+사용자 입력을 분석하여 아래 JSON 형식으로만 응답하세요. 설명 없이 JSON만 출력하세요.
+
+가능한 intent:
+- "help": 인사, 도움말, 사용법 질문
+- "weekly": 주간 현황 요청
+- "monthly": 월간 현황 요청
+- "summary": 요약/공유용 텍스트 요청
+- "date_range": 특정 기간 DMF 현황 (start_date, end_date 포함, YYYY-MM-DD 형식)
+- "ingredient": 성분명/제조소/신청인 검색 (keyword 포함)
+- "country": 국가별 DMF 현황 (country 포함)
+- "applicant": 신청인 지정 검색 (applicant + 선택적 month 포함)
+
+추가 파라미터:
+- keyword: 검색할 핵심 단어 (조사/불필요 단어 제거)
+- linked_filter: "linked" (연계심사 된 것만), "unlinked" (미연계만), null (전체)
+- month: 월 숫자 (없으면 null)
+- start_date, end_date: 기간 (YYYY-MM-DD, date_range일 때만)
+- country: 국가명 (country일 때만)
+- applicant: 신청인명 (applicant일 때만)
+
+예시:
+입력: "클래리 연계심사 된 제조원" → {{"intent":"ingredient","keyword":"클래리","linked_filter":"linked"}}
+입력: "2월9일부터 오늘까지 dmf현황" → {{"intent":"date_range","start_date":"{today.year}-02-09","end_date":"{today_str}"}}
+입력: "1월에 파마피아 등록현황" → {{"intent":"applicant","applicant":"파마피아","month":1}}
+입력: "파마피아" → {{"intent":"ingredient","keyword":"파마피아"}}
+입력: "인도 DMF 현황" → {{"intent":"country","country":"인도"}}
+입력: "오늘 신규 등록" → {{"intent":"date_range","start_date":"{today_str}","end_date":"{today_str}"}}
+입력: "최근 5일 등록 현황" → {{"intent":"date_range","start_date":"{(today - timedelta(days=5)).strftime('%Y-%m-%d')}","end_date":"{today_str}"}}
+입력: "Synthimed 제조소 검색" → {{"intent":"ingredient","keyword":"Synthimed"}}
+입력: "세파클러 중 연계 안된 제조원 알려줘" → {{"intent":"ingredient","keyword":"세파클러","linked_filter":"unlinked"}}
+입력: "신청인 국전약품 1월" → {{"intent":"applicant","applicant":"국전약품","month":1}}
+
+사용자 입력: "{utterance}"
+"""
+
+    try:
+        resp = requests.post(
+            f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={api_key}",
+            json={
+                "contents": [{"parts": [{"text": prompt}]}],
+                "generationConfig": {
+                    "temperature": 0,
+                    "maxOutputTokens": 200
+                }
+            },
+            timeout=3  # 카카오 5초 제한 고려
+        )
+
+        if resp.status_code != 200:
+            logger.warning(f"Gemini API 실패: {resp.status_code}")
+            return None
+
+        result = resp.json()
+        text_response = result['candidates'][0]['content']['parts'][0]['text']
+
+        # JSON 추출 (```json ... ``` 또는 순수 JSON)
+        json_match = re.search(r'\{[^{}]+\}', text_response)
+        if not json_match:
+            logger.warning(f"Gemini JSON 파싱 실패: {text_response}")
+            return None
+
+        parsed = json.loads(json_match.group())
+        intent = parsed.get('intent', 'help')
+
+        # intent별 params 구성
+        if intent == 'date_range':
+            start_str = parsed.get('start_date', today_str)
+            end_str = parsed.get('end_date', today_str)
+            try:
+                start = datetime.strptime(start_str, '%Y-%m-%d')
+                end = datetime.strptime(end_str, '%Y-%m-%d')
+            except:
+                start = end = today
+            return ('date_range', {'start': start, 'end': end})
+
+        elif intent == 'ingredient':
+            return ('ingredient', {
+                'ingredient': parsed.get('keyword', ''),
+                'linked_filter': parsed.get('linked_filter'),
+                'month': parsed.get('month')
+            })
+
+        elif intent == 'applicant':
+            return ('applicant', {
+                'applicant': parsed.get('applicant', parsed.get('keyword', '')),
+                'month': parsed.get('month')
+            })
+
+        elif intent == 'country':
+            return ('country', {
+                'country': parsed.get('country', parsed.get('keyword', ''))
+            })
+
+        elif intent in ('weekly', 'monthly', 'summary', 'help'):
+            return (intent, {})
+
+        return None
+
+    except requests.Timeout:
+        logger.warning("Gemini API 타임아웃 (3초)")
+        return None
+    except Exception as e:
+        logger.warning(f"Gemini 인텐트 분석 실패: {e}")
+        return None
+
+
 def parse_user_intent(utterance: str) -> tuple:
     """
     사용자 발화를 분석하여 의도와 파라미터 추출
 
     Returns:
         (intent, params) 튜플
-        intent: 'weekly' | 'monthly' | 'ingredient' | 'country' | 'applicant' | 'summary' | 'help'
+        intent: 'weekly' | 'monthly' | 'date_range' | 'ingredient' | 'country' | 'applicant' | 'summary' | 'help'
     """
     text = utterance.strip().lower()
+    today = datetime.today()
 
-    # 주간
-    if any(kw in text for kw in ['주간', '이번주', '이번 주', '금주', '지난주', '지난 주', '주별']):
-        return ('weekly', {})
+    # ─── 1. 인사 / 도움말 ───
+    if text in ['안녕', '하이', 'hi', 'hello', '시작', ''] or len(text) <= 1:
+        return ('help', {})
+    if any(kw in text for kw in ['도움', '사용법', '안내', '메뉴', '뭘 할 수', '기능', '명령', '뭐 할', '뭘 물', '어떻게']):
+        return ('help', {})
 
-    # 월간
-    if any(kw in text for kw in ['월간', '이번달', '이번 달', '전월', '지난달', '지난 달', '월별']):
-        return ('monthly', {})
-
-    # 요약 / 채팅 공유
+    # ─── 2. 요약 ───
     if any(kw in text for kw in ['요약', '공유', '정리', '카톡', '챗']):
         return ('summary', {})
 
-    # 신청인 검색 (패턴: "신청인 파마피아", "1월에 신청인 파마피아 현황")
-    # 월 추출
+    # ─── 3. 날짜/기간 관련 검색 ───
+    # "N월 N일부터 (오늘/N월 N일)까지" (구체적 범위 먼저!)
+    range_match = re.search(r'(\d{1,2})월\s*(\d{1,2})일\s*부터\s*(?:오늘|(\d{1,2})월\s*(\d{1,2})일)\s*까지', text)
+    if range_match:
+        sm, sd = int(range_match.group(1)), int(range_match.group(2))
+        start = datetime(today.year, sm, sd)
+        if range_match.group(3):
+            em, ed = int(range_match.group(3)), int(range_match.group(4))
+            end = datetime(today.year, em, ed)
+        else:
+            end = today
+        return ('date_range', {'start': start, 'end': end})
+
+    # "N일부터 오늘까지" (월 생략)
+    range_match2 = re.search(r'(\d{1,2})일\s*부터\s*오늘\s*까지', text)
+    if range_match2:
+        day = int(range_match2.group(1))
+        month_ctx = re.search(r'(\d{1,2})월', text)
+        m = int(month_ctx.group(1)) if month_ctx else today.month
+        start = datetime(today.year, m, day)
+        return ('date_range', {'start': start, 'end': today})
+
+    # "최근 N일"
+    recent_match = re.search(r'최근\s*(\d+)\s*일', text)
+    if recent_match:
+        days = int(recent_match.group(1))
+        return ('date_range', {'start': today - timedelta(days=days), 'end': today})
+
+    # "오늘 등록", "어제 현황" (일반적 오늘/어제)
+    if re.search(r'오늘.*(등록|dmf|현황|신규)', text) or re.search(r'(등록|dmf|현황|신규).*오늘', text):
+        return ('date_range', {'start': today, 'end': today})
+
+    if re.search(r'어제.*(등록|dmf|현황|신규)', text) or re.search(r'(등록|dmf|현황|신규).*어제', text):
+        yesterday = today - timedelta(days=1)
+        return ('date_range', {'start': yesterday, 'end': yesterday})
+
+    # "이번주", "주간", "금주"
+    if any(kw in text for kw in ['주간', '이번주', '이번 주', '금주', '지난주', '지난 주', '주별']):
+        return ('weekly', {})
+
+    # "월간", "이번달"
+    if any(kw in text for kw in ['월간', '이번달', '이번 달', '전월', '지난달', '지난 달', '월별']):
+        return ('monthly', {})
+
+    # ─── 4. 신청인 검색 ───
     month_match = re.search(r'(\d{1,2})월', text)
     month = int(month_match.group(1)) if month_match else None
 
-    # "신청인 XXX" 패턴
     applicant_match = re.search(r'(?:신청인|수입사|수입업체|거래처)\s*[:]?\s*(.+?)(?:\s*(?:현황|검색|조회|dmf|등록|몇개|갯수).*$|\s*\??\s*$)', text)
     if applicant_match:
         name = applicant_match.group(1).strip()
         if name:
             return ('applicant', {'applicant': name, 'month': month})
 
-    # "XXX 신청인" 패턴  (e.g., "파마피아 신청")
-    applicant_match2 = re.search(r'^(.+?)\s*(?:신청인|수입사|수입업체)\s*(?:현황|검색|조회|dmf|$)', text)
-    if applicant_match2:
-        name = applicant_match2.group(1).strip()
-        # 월 정보 제거
-        name = re.sub(r'\d{1,2}월\s*(?:에|의)?\s*', '', name).strip()
-        if name:
-            return ('applicant', {'applicant': name, 'month': month})
-
-    # 국가 검색 (패턴: "인도 DMF", "중국 현황" 등)
+    # ─── 5. 국가 검색 ───
     country_keywords = ['인도', '중국', '일본', '미국', '독일', '이탈리아', '스페인',
-                        '프랑스', '영국', '캐나다', '브라질', '대만', '한국', '이스라엘',
-                        'india', 'china', 'japan', 'usa', 'germany', 'italy', 'spain']
+                        '프랑스', '영국', '캐나다', '브라질', '대만', '한국', '이스라엘']
     for kw in country_keywords:
         if kw in text:
             return ('country', {'country': kw})
 
-    # 국가 패턴: "~나라 DMF", "~국가 현황"
-    country_match = re.search(r'(\S+)\s*(나라|국가)\s*(dmf|현황|제조)', text)
-    if country_match:
-        return ('country', {'country': country_match.group(1)})
-
-    # 도움말 / 메뉴
-    if any(kw in text for kw in ['도움', '사용법', '안내', '메뉴', '뭘 할 수', '기능', '명령', '뭐 할', '뭘 물', '어떻게']):
-        return ('help', {})
-
-    # 성분명/통합 검색 (연계심사 필터 + 월 필터 포함)
-    # 연계심사 필터 감지
+    # ─── 6. 성분/통합 검색 ───
     linked_filter = None
     if any(kw in text for kw in ['연계 안', '미연계', '연계안', '비연계', '연계 없']):
         linked_filter = 'unlinked'
     elif any(kw in text for kw in ['연계심사', '연계', 'linked']):
         linked_filter = 'linked'
 
-    # 월 추출 (여기서도 체크 — 신청인 인텐트에서 못 잡았을 경우)
-    month_match = re.search(r'(\d{1,2})월', text)
-    month = int(month_match.group(1)) if month_match else None
-
-    # 검색 키워드 추출 (불필요 단어 모두 제거)
+    # 검색 키워드 추출 (모든 불필요 단어 제거)
     clean_text = re.sub(
-        r'\s*(?:중|에서|의|에)?\s*(?:연계심사|미연계|비연계|연계|제조원|제조사|현황|검색|조회|dmf|등록|허여|된|안된|있는|없는|몇개|갯수|수|알려줘|보여줘|뭐야)\s*',
+        r'(?:연계심사|미연계|비연계|연계|제조원|제조사|현황|검색|조회|dmf|등록|허여|신규|'
+        r'된|안된|있는|없는|몇개|갯수|수|알려줘|보여줘|뭐야|좀|해줘|'
+        r'부터|까지|오늘|어제|최근|기간|중에서|중|에서|의|에)',
         ' ', text
     ).strip()
-    # 월 패턴 제거 ("1월에", "1월", "2월의" 등)
-    clean_text = re.sub(r'\d{1,2}월\s*(?:에|의|은|는)?\s*', '', clean_text).strip()
-    # 남은 조사/기호 정리
+    clean_text = re.sub(r'\d{1,2}월\s*(?:\d{1,2}일)?\s*(?:에|의|은|는)?\s*', '', clean_text).strip()
+    clean_text = re.sub(r'\d{1,2}일', '', clean_text).strip()
     clean_text = re.sub(r'\s+', ' ', clean_text).strip()
     clean_text = re.sub(r'[?？!]$', '', clean_text).strip()
     clean_text = re.sub(r'(?:은|는|이|가|을|를)$', '', clean_text).strip()
@@ -956,11 +1177,12 @@ def parse_user_intent(utterance: str) -> tuple:
     if clean_text and clean_text not in ['안녕', '하이', 'hi', 'hello', '시작'] and len(clean_text) > 1:
         return ('ingredient', {'ingredient': clean_text, 'linked_filter': linked_filter, 'month': month})
 
-    # 너무 짧거나 일반적인 인사는 help로
-    if len(text) <= 1 or text in ['안녕', '하이', 'hi', 'hello', '시작']:
-        return ('help', {})
+    # ─── 7. 위 모든 것에 해당 안 되면 ───
+    # 날짜 관련 단어만 있었으면 → 주간 현황으로
+    if any(kw in text for kw in ['등록', '현황', 'dmf', '신규']):
+        return ('weekly', {})
 
-    return ('ingredient', {'ingredient': utterance.strip(), 'linked_filter': linked_filter, 'month': month})
+    return ('help', {})
 
 
 # ─── 카카오 웹훅 엔드포인트들 ───
@@ -1019,6 +1241,14 @@ async def kakao_skill_handler(request: Request):
 
         intent, extracted = parse_user_intent(utterance)
 
+        # Gemini AI 인텐트 분석 시도 → 실패 시 regex 결과 사용
+        gemini_result = parse_intent_with_gemini(utterance)
+        if gemini_result:
+            intent, extracted = gemini_result
+            logger.info(f"🤖 Gemini: intent={intent}, params={extracted}")
+        else:
+            logger.info(f"📏 Regex: intent={intent}, params={extracted}")
+
         if intent == 'weekly':
             data = analyze_weekly_dmf()
             text = format_weekly_for_kakao(data)
@@ -1040,6 +1270,17 @@ async def kakao_skill_handler(request: Request):
         elif intent == 'summary':
             text = generate_chat_summary()
             return JSONResponse(kakao_simple_text(text))
+
+        elif intent == 'date_range':
+            start = extracted.get('start', datetime.today())
+            end = extracted.get('end', datetime.today())
+            data = search_date_range(start, end)
+            text = format_date_range_for_kakao(data)
+            return JSONResponse(kakao_quick_replies(text, [
+                {"messageText": "주간", "action": "message", "label": "📋 주간 현황"},
+                {"messageText": "월간", "action": "message", "label": "📊 월간 리포트"},
+                {"messageText": "도움", "action": "message", "label": "❓ 메뉴"}
+            ]))
 
         elif intent == 'country':
             country = extracted.get('country', params.get('country', ''))
@@ -1131,18 +1372,18 @@ async def kakao_skill_handler(request: Request):
                 "실시간으로 조회·분석합니다.\n\n"
                 "아래 버튼을 누르거나 직접 입력하세요!\n\n"
                 "💡 입력 예시:\n"
-                "• 클래리 → 성분별 제조원 현황\n"
-                "• 클래리 연계심사 → 연계심사 제조원만\n"
-                "• Synthimed → 제조소 검색\n"
+                "• 세파클러 → 제조원 현황\n"
+                "• 세파클러 연계심사 → 연계 제조원만\n"
                 "• 파마피아 → 신청인 검색\n"
                 "• 인도 → 국가별 DMF 현황\n"
-                "• 신청인 파마피아 → 신청인 지정 검색\n"
-                "• 1월에 신청인 국전약품 → 월별 신청인"
+                "• 2월9일부터 오늘까지 → 기간 검색\n"
+                "• 오늘 등록 → 당일 현황\n"
+                "• 최근 3일 → 최근 등록 현황"
             )
             return JSONResponse(kakao_quick_replies(help_text, [
                 {"messageText": "주간", "action": "message", "label": "📋 주간 현황"},
                 {"messageText": "월간", "action": "message", "label": "📊 월간 리포트"},
-                {"messageText": "요약", "action": "message", "label": "📝 채팅 공유용"},
+                {"messageText": "최근 3일", "action": "message", "label": "📅 최근 3일"},
                 {"messageText": "인도", "action": "message", "label": "🇮🇳 인도 DMF"}
             ]))
 
@@ -1255,3 +1496,4 @@ if __name__ == "__main__":
         print(f"🚀 DMF 카카오 챗봇 Server 시작 — Port {port}")
         print(f"   웹훅 URL: https://YOUR-APP.onrender.com/kakao/skill")
         uvicorn.run(app, host="0.0.0.0", port=port)
+
