@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: dmf-intelligence-mcp
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python server.py
+    envVars:
+      - key: PORT
+        value: 8000
+      - key: MCP_TRANSPORT
+        value: sse
