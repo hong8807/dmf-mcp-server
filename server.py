@@ -110,13 +110,19 @@ def _load_and_prepare(excel_path: str) -> pd.DataFrame:
     df = pd.read_excel(excel_path)
 
     # NaN 처리 (빈 칸을 빈 문자열로 변환)
-    text_cols = ['성분명', '신청인', '제조소명', '제조국가', '등록번호',
-                 '취소/취하구분', '연계심사문서번호']
+    text_cols = ['대상의약품', '성분명', '신청인', '제조소명', '제조소소재지',
+                 '제조국가', '등록번호', '취소/취하구분', '연계심사문서번호', '문서번호']
     for col in text_cols:
         if col in df.columns:
             df[col] = df[col].fillna('')
 
+    # 날짜 컬럼 처리
     df['최초등록일자'] = pd.to_datetime(df['최초등록일자'], errors='coerce')
+    df['최종변경일자'] = pd.to_datetime(df.get('최종변경일자', pd.Series(dtype='object')), errors='coerce')
+
+    # 최종연차보고년도 (숫자형)
+    if '최종연차보고년도' in df.columns:
+        df['최종연차보고년도'] = pd.to_numeric(df['최종연차보고년도'], errors='coerce')
 
     df['is_허여'] = df['등록번호'].astype(str).str.contains(r'\(', na=False)
     df['등록유형'] = df['is_허여'].map({True: '허여(변경)', False: '최초등록'})
@@ -140,11 +146,17 @@ def _build_data_digest(df: pd.DataFrame) -> str:
     lines.append(f"[DMF 데이터 요약] 기준일: {today.strftime('%Y-%m-%d')}")
     lines.append(f"총 정상 DMF 등록건수: {len(df)}건")
 
+    # 대상의약품 분포
+    if '대상의약품' in df.columns:
+        drug_type_dist = df['대상의약품'].value_counts()
+        type_str = " / ".join([f"{name} {cnt}건" for name, cnt in drug_type_dist.items()])
+        lines.append(f"대상의약품 분류: {type_str}")
+
     # 최초등록 vs 허여
     initial = int((~df['is_허여']).sum())
     change = int(df['is_허여'].sum())
     linked = int(df['has_연계심사'].sum())
-    lines.append(f"최초등록: {initial}건 / 허여(변경): {change}건 / 연계심사: {linked}건")
+    lines.append(f"최초등록: {initial}건 / 허여(변경): {change}건 / 연계심사(완제연계): {linked}건")
 
     # 상위 성분 TOP 20
     top_ing = df['성분명'].value_counts().head(20)
@@ -315,6 +327,7 @@ def analyze_weekly_dmf(weeks_ago: int = 1) -> dict:
         for _, row in week_df.iterrows():
             details.append({
                 "등록일": row['최초등록일자'].strftime('%m/%d'),
+                "대상의약품": str(row.get('대상의약품', '')),
                 "등록유형": '허여' if row['is_허여'] else '최초',
                 "성분명": str(row.get('성분명', '')),
                 "신청인": str(row.get('신청인', '')),
@@ -323,12 +336,16 @@ def analyze_weekly_dmf(weeks_ago: int = 1) -> dict:
                 "연계심사": 'O' if row['has_연계심사'] else 'X'
             })
 
+        # 대상의약품 분포
+        drug_type_dist = week_df['대상의약품'].value_counts().to_dict() if '대상의약품' in week_df.columns else {}
+
         return {
             "기간": week_label,
             "총건수": len(week_df),
             "최초등록": int((~week_df['is_허여']).sum()),
             "허여_변경": int(week_df['is_허여'].sum()),
             "연계심사_있음": int(week_df['has_연계심사'].sum()),
+            "대상의약품_분포": {k: int(v) for k, v in drug_type_dist.items()},
             "상세내역": details
         }
     except Exception as e:
@@ -441,7 +458,9 @@ def search_ingredient(ingredient: str, linked_filter: str = None) -> dict:
 
                 mfr_data = {
                     "base_dmf": base,
+                    "대상의약품": str(first_row.get('대상의약품', '')),
                     "제조소": str(first_row.get('제조소명', '')),
+                    "소재지": str(first_row.get('제조소소재지', ''))[:40],
                     "국가": str(first_row.get('제조국가', '')).replace('@', '/'),
                     "신청인": str(first_row.get('신청인', '')),
                     "등록일": first_row['최초등록일자'].strftime('%Y-%m-%d') if pd.notna(first_row['최초등록일자']) else '',
@@ -522,12 +541,28 @@ def search_country(country: str) -> dict:
             for name, cnt in top_mfrs.items()
         ]
 
+        # 대상의약품 분포
+        drug_type_dist = found['대상의약품'].value_counts().to_dict() if '대상의약품' in found.columns else {}
+
+        # 연계심사 통계
+        linked_count = int(found['has_연계심사'].sum())
+
+        # 주요 신청인
+        top_applicants = found['신청인'].value_counts().head(5)
+        applicant_list = [
+            {"신청인": name, "건수": int(cnt)}
+            for name, cnt in top_applicants.items() if name
+        ]
+
         return {
             "검색_국가": country,
             "전체_등록건수": len(found),
             "최근3개월_신규": len(recent),
+            "대상의약품_분포": {k: int(v) for k, v in drug_type_dist.items()},
+            "연계심사_수": linked_count,
             "주요_성분_TOP10": ingredient_list,
-            "주요_제조소_TOP10": mfr_list
+            "주요_제조소_TOP10": mfr_list,
+            "주요_신청인_TOP5": applicant_list
         }
     except Exception as e:
         logger.error(f"국가 검색 실패: {e}")
@@ -579,8 +614,11 @@ def search_applicant(applicant: str, month: int = None) -> dict:
                     "등록일": first['최초등록일자'].strftime('%Y-%m-%d') if pd.notna(first['최초등록일자']) else ''
                 })
 
+            drug_type = str(group.iloc[0].get('대상의약품', '')) if len(group) > 0 else ''
+
             ingredient_list.append({
                 "성분명": str(name),
+                "대상의약품": drug_type,
                 "등록건수": len(group),
                 "제조원수": mfr_count,
                 "제조원": mfrs
@@ -593,11 +631,19 @@ def search_applicant(applicant: str, month: int = None) -> dict:
             country_dist[main_country] += 1
         country_list = [{"국가": k, "건수": v} for k, v in country_dist.most_common()]
 
+        # 대상의약품 분포
+        drug_type_dist = found_month['대상의약품'].value_counts().to_dict() if '대상의약품' in found_month.columns else {}
+
+        # 연계심사 수
+        linked_count = int(found_month['has_연계심사'].sum())
+
         return {
             "검색_신청인": applicant,
             "기간": month_label,
             "총_등록건수": len(found_month),
             "취급_성분수": len(ingredient_list),
+            "대상의약품_분포": {k: int(v) for k, v in drug_type_dist.items()},
+            "연계심사_수": linked_count,
             "국가별_분포": country_list,
             "성분별_현황": sorted(ingredient_list, key=lambda x: x['등록건수'], reverse=True)
         }
@@ -622,15 +668,23 @@ def search_manufacturer(keyword: str) -> dict:
             lambda x: x.split('(')[0] if '(' in x else x
         )
 
+        # 제조소 소재지 (첫 번째 행에서 추출)
+        address = str(found_copy.iloc[0].get('제조소소재지', ''))[:80] if len(found_copy) > 0 else ''
+
+        # 대상의약품 분포
+        drug_type_dist = found_copy['대상의약품'].value_counts().to_dict() if '대상의약품' in found_copy.columns else {}
+
         # 성분별 현황
         ingredient_list = []
         for name, group in found_copy.groupby('성분명'):
             mfr_count = group['base_dmf'].nunique()
             linked_count = group[group['has_연계심사']]['base_dmf'].nunique()
             applicants = group['신청인'].unique().tolist()
+            drug_type = str(group.iloc[0].get('대상의약품', '')) if len(group) > 0 else ''
 
             ingredient_list.append({
                 "성분명": str(name),
+                "대상의약품": drug_type,
                 "제조원수": mfr_count,
                 "연계심사_수": linked_count,
                 "신청인": [a for a in applicants if a][:3]
@@ -644,8 +698,10 @@ def search_manufacturer(keyword: str) -> dict:
 
         return {
             "검색_제조소": keyword,
+            "소재지": address,
             "총_등록건수": len(found),
             "취급_성분수": len(ingredient_list),
+            "대상의약품_분포": {k: int(v) for k, v in drug_type_dist.items()},
             "국가별_분포": [{"국가": k, "건수": v} for k, v in country_dist.most_common()],
             "성분별_현황": sorted(ingredient_list, key=lambda x: x['제조원수'], reverse=True)
         }
@@ -894,18 +950,25 @@ def format_weekly_for_kakao(data: dict) -> str:
     if data.get("총건수", 0) == 0:
         return f"📋 DMF 주간 현황 ({data['기간']})\n\n{data.get('메시지', '등록 없음')}"
 
+    # 대상의약품 분포 요약
+    drug_dist = data.get("대상의약품_분포", {})
+    drug_str = " / ".join([f"{k} {v}" for k, v in drug_dist.items()]) if drug_dist else ""
+
     lines = [
         f"📋 DMF 주간 현황 ({data['기간']})",
         f"{'─'*24}",
         f"총 {data['총건수']}건 (최초 {data['최초등록']} / 허여 {data['허여_변경']})",
         f"연계심사 {data['연계심사_있음']}건",
-        ""
     ]
+    if drug_str:
+        lines.append(f"📦 {drug_str}")
+    lines.append("")
 
     for item in data.get("상세내역", [])[:15]:  # 카카오톡 글자수 제한 고려
         reg_icon = "🔵" if item['등록유형'] == '최초' else "🟡"
         linked = " ✅" if item['연계심사'] == 'O' else ""
-        lines.append(f"{reg_icon} {item['성분명']}")
+        drug_tag = f"[{item.get('대상의약품', '')}] " if item.get('대상의약품') else ""
+        lines.append(f"{reg_icon} {drug_tag}{item['성분명']}")
         lines.append(f"  {item['신청인']} | {item['국가']}{linked}")
 
     if len(data.get("상세내역", [])) > 15:
@@ -976,7 +1039,8 @@ def format_ingredient_for_kakao(data: dict) -> str:
             status_mark = "❌" if m['상태'] != '정상' else ""
             heo = f"+{m['허여_수']}허여" if m['허여_수'] > 0 else ""
             country = m['국가'].split('/')[0]  # 첫 번째 국가만
-            lines.append(f"  {linked_mark} {m['제조소'][:20]} ({country})")
+            drug_tag = f"[{m.get('대상의약품', '')}]" if m.get('대상의약품') else ""
+            lines.append(f"  {linked_mark} {m['제조소'][:20]} ({country}) {drug_tag}")
             lines.append(f"     {m['신청인'][:12]} {heo}{status_mark}")
 
     lines.append(f"\n{'─'*24}")
@@ -989,12 +1053,19 @@ def format_country_for_kakao(data: dict) -> str:
     if data.get("전체_등록건수", 0) == 0:
         return f"🌍 '{data['검색_국가']}' 검색 결과\n\n{data.get('메시지', '등록 없음')}"
 
+    # 대상의약품 분포
+    drug_dist = data.get("대상의약품_분포", {})
+    drug_str = " / ".join([f"{k} {v}" for k, v in drug_dist.items()]) if drug_dist else ""
+
     lines = [
         f"🌍 {data['검색_국가']} DMF 현황",
         f"{'─'*24}",
         f"전체 {data['전체_등록건수']}건 (최근3개월 {data['최근3개월_신규']}건)",
-        ""
+        f"연계심사 {data.get('연계심사_수', 0)}건",
     ]
+    if drug_str:
+        lines.append(f"📦 {drug_str}")
+    lines.append("")
 
     if data.get("주요_성분_TOP10"):
         lines.append("💊 주요 성분:")
@@ -1006,6 +1077,11 @@ def format_country_for_kakao(data: dict) -> str:
         for item in data["주요_제조소_TOP10"][:5]:
             lines.append(f"  {item['제조소'][:25]}: {item['건수']}건")
 
+    if data.get("주요_신청인_TOP5"):
+        lines.append("\n👤 주요 신청인:")
+        for item in data["주요_신청인_TOP5"]:
+            lines.append(f"  {item['신청인']}: {item['건수']}건")
+
     lines.append("\n출처: 의약품안전나라")
     return "\n".join(lines)
 
@@ -1015,12 +1091,19 @@ def format_applicant_for_kakao(data: dict) -> str:
     if data.get("총_등록건수", 0) == 0:
         return f"👤 '{data['검색_신청인']}' 검색 결과\n\n{data.get('메시지', '등록 없음')}"
 
+    # 대상의약품 분포
+    drug_dist = data.get("대상의약품_분포", {})
+    drug_str = " / ".join([f"{k} {v}" for k, v in drug_dist.items()]) if drug_dist else ""
+
     lines = [
         f"👤 '{data['검색_신청인']}' DMF 현황",
         f"   ({data['기간']})",
         f"{'─'*24}",
         f"📋 총 {data['총_등록건수']}건 | 취급 성분 {data['취급_성분수']}종",
+        f"연계심사 {data.get('연계심사_수', 0)}건",
     ]
+    if drug_str:
+        lines.append(f"📦 {drug_str}")
 
     # 국가별 분포
     country_dist = data.get("국가별_분포", [])
@@ -1034,7 +1117,8 @@ def format_applicant_for_kakao(data: dict) -> str:
     ingredients = data.get("성분별_현황", [])
     if ingredients:
         for item in ingredients[:8]:
-            lines.append(f"\n💊 {item['성분명'][:20]}")
+            drug_tag = f" [{item.get('대상의약품', '')}]" if item.get('대상의약품') else ""
+            lines.append(f"\n💊 {item['성분명'][:20]}{drug_tag}")
             lines.append(f"   제조원 {item['제조원수']}개사")
             for mfr in item.get('제조원', [])[:3]:
                 lines.append(f"   ▪ {mfr['제조소'][:22]} ({mfr['국가']})")
@@ -1051,11 +1135,22 @@ def format_manufacturer_for_kakao(data: dict) -> str:
     if data.get("총건수", 0) == 0:
         return f"🏭 '{data['검색_제조소']}' 검색 결과\n\n{data.get('메시지', '등록 없음')}"
 
+    # 대상의약품 분포
+    drug_dist = data.get("대상의약품_분포", {})
+    drug_str = " / ".join([f"{k} {v}" for k, v in drug_dist.items()]) if drug_dist else ""
+
     lines = [
         f"🏭 '{data['검색_제조소']}' 제조소 현황",
         f"{'─'*24}",
         f"📋 총 {data['총_등록건수']}건 | 취급 성분 {data['취급_성분수']}종",
     ]
+    if drug_str:
+        lines.append(f"📦 {drug_str}")
+
+    # 소재지
+    address = data.get("소재지", "")
+    if address:
+        lines.append(f"📍 {address[:50]}")
 
     country_dist = data.get("국가별_분포", [])
     if country_dist:
@@ -1069,7 +1164,8 @@ def format_manufacturer_for_kakao(data: dict) -> str:
         for item in ingredients[:12]:
             linked_mark = f"✅{item['연계심사_수']}" if item['연계심사_수'] > 0 else "⬜0"
             apps = ", ".join(item.get('신청인', [])[:2])
-            lines.append(f"💊 {item['성분명'][:20]}")
+            drug_tag = f"[{item.get('대상의약품', '')}] " if item.get('대상의약품') else ""
+            lines.append(f"💊 {drug_tag}{item['성분명'][:20]}")
             lines.append(f"   제조원 {item['제조원수']}개 | 연계 {linked_mark} | {apps[:15]}")
 
     if len(ingredients) > 12:
@@ -1280,6 +1376,12 @@ def handle_with_gemini(utterance: str) -> Optional[str]:
 
     system_prompt = f"""당신은 DMF Intelligence, 한국 의약품안전나라의 DMF(Drug Master File) 등록 데이터 전문 AI 어시스턴트입니다.
 
+핵심 용어:
+- 대상의약품: 별표1(일반 원료의약품), 신물질(신규 화합물), 기타, 별표1의2, 인태반유래
+- 연계심사(완제연계심사): DMF가 완제의약품 품목허가 시 연계되어 심사된 경우. 연계심사 여부는 해당 원료의 품질 신뢰도 지표
+- 허여(변경): 기등록 DMF의 변경등록 (제조소 추가, 규격 변경 등)
+- 최초등록: 신규로 DMF를 처음 등록한 건
+
 규칙:
 1. 항상 한국어로 응답하세요.
 2. 응답은 3500자 이내로 유지하세요 (카카오톡 제한).
@@ -1289,6 +1391,7 @@ def handle_with_gemini(utterance: str) -> Optional[str]:
 6. 이모지를 적절히 사용하되 과하지 않게 하세요.
 7. 출처: 의약품안전나라를 응답 끝에 포함하세요.
 8. 모르는 것은 솔직히 모른다고 하세요.
+9. 대상의약품 분류(별표1, 신물질 등)를 결과에 포함하세요.
 
 오늘 날짜: {today.strftime('%Y-%m-%d')}
 
