@@ -1181,18 +1181,30 @@ pandas DataFrame 'df'가 주어집니다. 사용자 질문에 답하는 Python �
             'sorted': sorted, 'reversed': reversed, 'min': min, 'max': max,
             'sum': sum, 'abs': abs, 'round': round,
             'True': True, 'False': False, 'None': None,
-            'print': lambda *a, **k: None,  # print 무시
+            'print': lambda *a, **k: None,
             'isinstance': isinstance, 'type': type,
             'map': map, 'filter': filter,
             'chr': chr, 'ord': ord,
+            'any': any, 'all': all,
+            'hasattr': hasattr, 'getattr': getattr,
         }
 
-        # 실행
-        exec_globals = {"__builtins__": safe_builtins}
-        exec_globals.update(local_vars)
-        exec(code_text, exec_globals)
+        # 실행 (globals에 모든 것을 넣어 함수/변수 스코프 문제 방지)
+        exec_env = dict(safe_builtins)
+        exec_env['__builtins__'] = safe_builtins
+        exec_env['df'] = df
+        exec_env['pd'] = pd
+        exec_env['Counter'] = Counter
+        exec_env['datetime'] = datetime
+        exec_env['timedelta'] = timedelta
+        exec_env['result'] = '분석 결과를 생성하지 못했습니다.'
 
-        result = exec_globals.get('result', '분석 결과를 생성하지 못했습니다.')
+        try:
+            exec(code_text, exec_env)
+            result = exec_env.get('result', '분석 결과를 생성하지 못했습니다.')
+        except Exception as exec_err:
+            logger.error(f"코드 실행 에러: {exec_err}")
+            result = f"코드 실행 중 오류: {str(exec_err)[:100]}"
 
         # 결과 길이 제한 (카카오 1000자)
         result = str(result)
@@ -1479,7 +1491,7 @@ async def kakao_skill_handler(request: Request):
             applicant = extracted.get('applicant', params.get('applicant', ''))
             month = extracted.get('month')
             if not applicant:
-                return JSONResponse(kakao_simple_text("검색할 신청인명을 입력해주세요.\n\n예: 신청인 파마피아\n예: 1월에 신청인 국전약품 현황"))
+                return JSONResponse(kakao_simple_text("검색할 신청인명을 입력해주세요.\n\n예: 신청인 휴시드\n예: 1월에 신청인 국전약품 현황"))
             data = search_applicant(applicant, month)
             text = format_applicant_for_kakao(data)
             return JSONResponse(kakao_quick_replies(text, [
@@ -1492,7 +1504,7 @@ async def kakao_skill_handler(request: Request):
             keyword = extracted.get('ingredient', params.get('ingredient', ''))
             linked_filter = extracted.get('linked_filter')
             if not keyword:
-                return JSONResponse(kakao_simple_text("검색어를 입력해주세요.\n\n예: 클래리, Synthimed, 파마피아"))
+                return JSONResponse(kakao_simple_text("검색어를 입력해주세요.\n\n예: 세파클러, 휴시드, 인도"))
 
             # 연계 필터가 있으면 성분명 검색 고정
             if linked_filter:
@@ -1554,7 +1566,7 @@ async def kakao_skill_handler(request: Request):
                 "아래 버튼을 누르거나 직접 입력하세요!\n\n"
                 "💡 입력 예시:\n"
                 "• 세파클러 → 제조원 현황\n"
-                "• 파마피아 → 신청인 검색\n"
+                "• 휴시드 → 신청인 검색\n"
                 "• 인도 → 국가별 DMF 현황\n"
                 "• 2월9일부터 오늘까지 → 기간\n"
                 "• 최근 3일 → 최근 등록 현황\n\n"
