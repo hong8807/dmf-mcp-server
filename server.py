@@ -975,10 +975,20 @@ def parse_intent_with_gemini(utterance: str) -> tuple:
 - "monthly": 월간 현황 요청
 - "summary": 요약/공유용 텍스트 요청
 - "date_range": 특정 기간 DMF 현황 (start_date, end_date 포함, YYYY-MM-DD 형식)
-- "ingredient": 성분명/제조소/신청인 검색 (keyword 포함)
+- "ingredient": 성분명 하나만 단순 검색 (예: "세파클러", "클래리 연계심사")
 - "country": 국가별 DMF 현황 (country 포함)
-- "applicant": 신청인 지정 검색 (applicant + 선택적 month 포함)
-- "analysis": 데이터 분석/통계/조건부 질문 (제조원수 몇 개 이하, 가장 많은, 비교, 통계 등)
+- "applicant": 신청인명 하나만 단순 검색 (예: "신청인 휴시드")
+- "analysis": 아래 중 하나라도 해당하면 반드시 analysis로 분류:
+  * 조건부 질문 (N개 이하, N개 이상, ~만, ~중에서)
+  * 리스트/목록 요청 (리스트, 목록, 보여줘, 뭐가 있어)
+  * 통계/비교 (가장 많은, Top N, 비율, 비교, 평균)
+  * 복합 조건 (성분+허여, 성분+신청인, 국가+성분 등 2개 이상 조건)
+  * 특정 등록유형 필터 (허여건, 최초등록건)
+  * "~인 것", "~인 성분", "~인 신청인" 패턴
+  * 자유로운 질문/분석 요청
+
+중요: 단순히 성분명이나 신청인만 입력하면 ingredient/applicant이지만,
+추가 조건이나 특정 데이터를 요구하면 analysis입니다.
 
 추가 파라미터:
 - keyword: 검색할 핵심 단어 (조사/불필요 단어 제거)
@@ -990,6 +1000,7 @@ def parse_intent_with_gemini(utterance: str) -> tuple:
 - question: 원래 질문 (analysis일 때만, 원문 그대로)
 
 예시:
+입력: "세파클러" → {{"intent":"ingredient","keyword":"세파클러"}}
 입력: "클래리 연계심사 된 제조원" → {{"intent":"ingredient","keyword":"클래리","linked_filter":"linked"}}
 입력: "2월9일부터 오늘까지 dmf현황" → {{"intent":"date_range","start_date":"{today.year}-02-09","end_date":"{today_str}"}}
 입력: "1월에 파마피아 등록현황" → {{"intent":"applicant","applicant":"파마피아","month":1}}
@@ -997,14 +1008,17 @@ def parse_intent_with_gemini(utterance: str) -> tuple:
 입력: "인도 DMF 현황" → {{"intent":"country","country":"인도"}}
 입력: "오늘 신규 등록" → {{"intent":"date_range","start_date":"{today_str}","end_date":"{today_str}"}}
 입력: "최근 5일 등록 현황" → {{"intent":"date_range","start_date":"{(today - timedelta(days=5)).strftime('%Y-%m-%d')}","end_date":"{today_str}"}}
-입력: "Synthimed 제조소 검색" → {{"intent":"ingredient","keyword":"Synthimed"}}
-입력: "세파클러 중 연계 안된 제조원 알려줘" → {{"intent":"ingredient","keyword":"세파클러","linked_filter":"unlinked"}}
 입력: "신청인 국전약품 1월" → {{"intent":"applicant","applicant":"국전약품","month":1}}
 입력: "제조원수가 3개 이하인 품목은?" → {{"intent":"analysis","question":"제조원수가 3개 이하인 품목은?"}}
 입력: "연계심사 비율이 가장 높은 성분 top 10" → {{"intent":"analysis","question":"연계심사 비율이 가장 높은 성분 top 10"}}
-입력: "중국 제조소가 가장 많은 성분은?" → {{"intent":"analysis","question":"중국 제조소가 가장 많은 성분은?"}}
+입력: "에피나스틴 허여 신청인 리스트" → {{"intent":"analysis","question":"에피나스틴 허여 신청인 리스트"}}
+입력: "세파클러 휴시드 신청인으로 등록된거" → {{"intent":"analysis","question":"세파클러 휴시드 신청인으로 등록된거"}}
+입력: "인도 제조소에서 연계심사 된 성분 목록" → {{"intent":"analysis","question":"인도 제조소에서 연계심사 된 성분 목록"}}
 입력: "올해 신규 등록 건수가 가장 많은 신청인은?" → {{"intent":"analysis","question":"올해 신규 등록 건수가 가장 많은 신청인은?"}}
 입력: "인도와 중국 제조원 비교" → {{"intent":"analysis","question":"인도와 중국 제조원 비교"}}
+입력: "휴시드 DMF 분석" → {{"intent":"analysis","question":"휴시드 DMF 분석"}}
+입력: "최초등록이 가장 오래된 DMF는?" → {{"intent":"analysis","question":"최초등록이 가장 오래된 DMF는?"}}
+입력: "아목시실린 제조국가별 분포" → {{"intent":"analysis","question":"아목시실린 제조국가별 분포"}}
 
 사용자 입력: "{utterance}"
 """
