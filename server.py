@@ -1125,8 +1125,9 @@ pandas DataFrame 'df'가 주어집니다. 사용자 질문에 답하는 Python �
 2. 결과는 카카오톡 메시지용이므로 간결하게 (최대 800자)
 3. 목록은 최대 15개까지만 표시하고 나머지는 "외 N개"로
 4. 이모지를 적절히 사용 (📊💊🏭 등)
-5. pandas와 기본 Python만 사용 가능
-6. 코드만 출력하세요. 설명이나 ```python 마크다운 없이
+5. import문 절대 사용 금지! df, pd, Counter, datetime, timedelta는 이미 사용 가능
+6. 함수로 감싸지 말고 바로 코드만 작성 (def 사용 금지)
+7. 코드만 출력하세요. 설명이나 ```python 마크다운 없이
 
 사용자 질문: "{question}"
 """
@@ -1157,6 +1158,15 @@ pandas DataFrame 'df'가 주어집니다. 사용자 질문에 답하는 Python �
         code_text = re.sub(r'```\s*', '', code_text)
         code_text = code_text.strip()
 
+        # 안전 처리: import문 제거, print 무시
+        code_lines = []
+        for line in code_text.split('\n'):
+            stripped = line.strip()
+            if stripped.startswith('import ') or stripped.startswith('from '):
+                continue  # import 제거
+            code_lines.append(line)
+        code_text = '\n'.join(code_lines)
+
         logger.info(f"🧪 Gemini 생성 코드:\n{code_text}")
 
         # 안전한 실행 환경
@@ -1178,10 +1188,11 @@ pandas DataFrame 'df'가 주어집니다. 사용자 질문에 답하는 Python �
         }
 
         # 실행
-        local_vars = {'df': df, 'pd': pd, 'Counter': Counter, 'datetime': datetime, 'timedelta': timedelta}
-        exec(code_text, {"__builtins__": safe_builtins}, local_vars)
+        exec_globals = {"__builtins__": safe_builtins}
+        exec_globals.update(local_vars)
+        exec(code_text, exec_globals)
 
-        result = local_vars.get('result', '분석 결과를 생성하지 못했습니다.')
+        result = exec_globals.get('result', '분석 결과를 생성하지 못했습니다.')
 
         # 결과 길이 제한 (카카오 1000자)
         result = str(result)
