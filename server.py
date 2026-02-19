@@ -14,6 +14,7 @@ import json
 import tempfile
 import logging
 import re
+import threading
 from datetime import datetime, timedelta
 from collections import Counter
 from typing import Optional
@@ -1349,13 +1350,16 @@ async def kakao_skill_handler(request: Request):
     
     사용자 발화를 자동 분석하여 적절한 DMF 정보를 반환합니다.
     오픈빌더의 '폴백 블록'에 연결하면, 모든 입력을 여기서 처리합니다.
+    
+    AI 챗봇 모드: callbackUrl이 있으면 분석 질문은 비동기 콜백으로 처리
     """
     try:
         body = await request.json()
         utterance = body.get("userRequest", {}).get("utterance", "")
         params = body.get("action", {}).get("params", {})
+        callback_url = body.get("userRequest", {}).get("callbackUrl", "")
 
-        logger.info(f"📨 카카오 요청: '{utterance}' | params: {params}")
+        logger.info(f"📨 카카오 요청: '{utterance}' | callback: {'있음' if callback_url else '없음'}")
 
         # 캐시가 아직 준비 안 됐으면 즉시 안내
         if _cache["df"] is None and _cache["loading"]:
@@ -1373,7 +1377,49 @@ async def kakao_skill_handler(request: Request):
         else:
             logger.info(f"📏 Regex: intent={intent}, params={extracted}")
 
-        if intent == 'weekly':
+        # ── analysis 인텐트: 콜백으로 비동기 처리 ──
+        if intent == 'analysis':
+            question = extracted.get('question', utterance)
+
+            if callback_url:
+                # 백그라운드에서 분석 실행 → 콜백으로 전송
+                def run_and_callback():
+                    try:
+                        result_text = run_analysis_with_gemini(question)
+                        callback_body = {
+                            "version": "2.0",
+                            "template": {
+                                "outputs": [{"simpleText": {"text": result_text}}],
+                                "quickReplies": [
+                                    {"messageText": "주간", "action": "message", "label": "📋 주간 현황"},
+                                    {"messageText": "도움", "action": "message", "label": "❓ 메뉴"}
+                                ]
+                            }
+                        }
+                        cb_resp = requests.post(callback_url, json=callback_body, timeout=5)
+                        logger.info(f"📤 콜백 전송 완료: {cb_resp.status_code}")
+                    except Exception as e:
+                        logger.error(f"❌ 콜백 실패: {e}")
+
+                threading.Thread(target=run_and_callback, daemon=True).start()
+
+                # 즉시 "분석 중" 응답 (5초 안에 반환)
+                return JSONResponse({
+                    "version": "2.0",
+                    "useCallback": True,
+                    "template": {
+                        "outputs": [{"simpleText": {"text": "🤖 AI가 데이터를 분석하고 있습니다...\n잠시만 기다려주세요!"}}]
+                    }
+                })
+            else:
+                # 콜백 없으면 직접 처리 (5초 초과 위험)
+                text = run_analysis_with_gemini(question)
+                return JSONResponse(kakao_quick_replies(text, [
+                    {"messageText": "주간", "action": "message", "label": "📋 주간 현황"},
+                    {"messageText": "도움", "action": "message", "label": "❓ 메뉴"}
+                ]))
+
+        elif intent == 'weekly':
             data = analyze_weekly_dmf()
             text = format_weekly_for_kakao(data)
             return JSONResponse(kakao_quick_replies(text, [
@@ -1428,14 +1474,6 @@ async def kakao_skill_handler(request: Request):
             return JSONResponse(kakao_quick_replies(text, [
                 {"messageText": "주간", "action": "message", "label": "📋 주간 현황"},
                 {"messageText": "월간", "action": "message", "label": "📊 월간 리포트"},
-                {"messageText": "도움", "action": "message", "label": "❓ 메뉴"}
-            ]))
-
-        elif intent == 'analysis':
-            question = extracted.get('question', utterance)
-            text = run_analysis_with_gemini(question)
-            return JSONResponse(kakao_quick_replies(text, [
-                {"messageText": "주간", "action": "message", "label": "📋 주간 현황"},
                 {"messageText": "도움", "action": "message", "label": "❓ 메뉴"}
             ]))
 
