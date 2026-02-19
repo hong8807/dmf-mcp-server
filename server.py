@@ -1128,6 +1128,9 @@ pandas DataFrame 'df'가 주어집니다. 사용자 질문에 답하는 Python �
 5. import문 절대 사용 금지! df, pd, Counter, datetime, timedelta는 이미 사용 가능
 6. 함수로 감싸지 말고 바로 코드만 작성 (def 사용 금지)
 7. 코드만 출력하세요. 설명이나 ```python 마크다운 없이
+8. 특정 회사/성분/국가가 언급되면 반드시 해당 조건으로 df를 필터링한 후 분석하세요
+   예: "휴시드 분석" → df[df['신청인'].str.contains('휴시드')]로 필터 후 분석
+   예: "인도 제조소 분석" → df[df['제조국가'].str.contains('인도')]로 필터 후 분석
 
 사용자 질문: "{question}"
 """
@@ -1173,25 +1176,9 @@ pandas DataFrame 'df'가 주어집니다. 사용자 질문에 답하는 Python �
         active = _get_cached_data()
         df = active.copy()
 
-        # 허용된 빌트인 함수만
-        safe_builtins = {
-            'len': len, 'str': str, 'int': int, 'float': float, 'bool': bool,
-            'list': list, 'dict': dict, 'tuple': tuple, 'set': set,
-            'range': range, 'enumerate': enumerate, 'zip': zip,
-            'sorted': sorted, 'reversed': reversed, 'min': min, 'max': max,
-            'sum': sum, 'abs': abs, 'round': round,
-            'True': True, 'False': False, 'None': None,
-            'print': lambda *a, **k: None,
-            'isinstance': isinstance, 'type': type,
-            'map': map, 'filter': filter,
-            'chr': chr, 'ord': ord,
-            'any': any, 'all': all,
-            'hasattr': hasattr, 'getattr': getattr,
-        }
-
-        # 실행 (globals에 모든 것을 넣어 함수/변수 스코프 문제 방지)
-        exec_env = dict(safe_builtins)
-        exec_env['__builtins__'] = safe_builtins
+        # 실행 환경 (Gemini 생성 코드 전용 — 사용자 직접 입력 아님)
+        import builtins as _builtins
+        exec_env = {'__builtins__': _builtins}
         exec_env['df'] = df
         exec_env['pd'] = pd
         exec_env['Counter'] = Counter
